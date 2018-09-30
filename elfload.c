@@ -3,16 +3,27 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/random.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <syscall.h>
 #include <unistd.h>
 
 typedef uint64_t u64;
 typedef uint8_t u8;
+typedef struct auxv_t {
+    u64 a_type;
+    union {
+        u64 a_val;
+        void *a_ptr;
+        const char *a_str;
+    };
+} auxv_t;
+extern char **environ;
 #define PAGE_SIZE 4096
 #define NORETURN __attribute__((noreturn))
 #define STACK_SIZE (4 * 1024 * 1024)
@@ -34,7 +45,46 @@ static const char *get_ptype_name(int ptype) {
         CASE(PT_GNU_RELRO);
         CASE(PT_SUNWBSS);
         CASE(PT_SUNWSTACK);
-    default: return NULL;
+    default: return "unknown";
+    }
+}
+static const char *get_atype_name(int atype) {
+    switch (atype) {
+CASE(AT_NULL);
+CASE(AT_IGNORE);
+CASE(AT_EXECFD);
+CASE(AT_PHDR);
+CASE(AT_PHENT);
+CASE(AT_PHNUM);
+CASE(AT_PAGESZ);
+CASE(AT_BASE);
+CASE(AT_FLAGS);
+CASE(AT_ENTRY);
+CASE(AT_NOTELF);
+CASE(AT_UID);
+CASE(AT_EUID);
+CASE(AT_GID);
+CASE(AT_EGID);
+CASE(AT_CLKTCK);
+CASE(AT_PLATFORM);
+CASE(AT_HWCAP);
+CASE(AT_FPUCW);
+CASE(AT_DCACHEBSIZE);
+CASE(AT_ICACHEBSIZE);
+CASE(AT_UCACHEBSIZE);
+CASE(AT_IGNOREPPC);
+CASE(AT_SECURE);
+CASE(AT_BASE_PLATFORM);
+CASE(AT_RANDOM);
+CASE(AT_HWCAP2);
+CASE(AT_EXECFN);
+CASE(AT_SYSINFO);
+CASE(AT_SYSINFO_EHDR);
+CASE(AT_L1I_CACHESHAPE);
+CASE(AT_L1D_CACHESHAPE);
+CASE(AT_L2_CACHESHAPE);
+CASE(AT_L3_CACHESHAPE);
+    default: return "unknown";
     }
 }
 
@@ -141,9 +191,109 @@ static u64 round_up(u64 x, u64 align) {
 }
 
 static NORETURN void switch_to(void* stack, uintptr_t rip) {
-    asm volatile("mov %0, %%rsp; jmp *%1":: "r"(stack), "r"(rip));
-    // Shoul be unreachable!
+    asm volatile("mov %0, %%rsp; jmp *%1":: "r"(stack), "r"(rip), "d"(0));
+    // Should be unreachable!
     abort();
+}
+
+// Stack on entry:
+// [from %rsp and increasing addresses!]
+// argc
+// argv[argc]
+// nullptr
+// env[]
+// nullptr
+// aux[] (2 qwords each)
+// AT_NULL
+//
+// Remaining space may be used to copy the environment, arguments and aux
+// vector information.
+static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, auxv_t* auxv) {
+    size_t args_size = 0;
+    size_t argc = 0, envc = 0, auxc = 0;
+
+    char *const *p;
+    for (p = argv; *p; p++) {
+        args_size += strlen(*p) + 1;
+        argc++;
+    }
+    for (p = envp; *p; p++) {
+        args_size += strlen(*p) + 1;
+        envc++;
+    }
+    // For now, assume that the aux vector is always built by copying the one
+    // for the current process. In reality, it's filled in by the kernel.
+    for (auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
+        printf("input auxv %ld (%s): %p\n", auxp->a_type, get_atype_name(auxp->a_type), auxp->a_ptr);
+        auxc++;
+        switch (auxp->a_type) {
+        case AT_RANDOM:
+            args_size += 16;
+            break;
+        case AT_PLATFORM:
+            args_size += strlen(auxp->a_str) + 1;
+            break;
+        }
+    }
+
+    // TODO Check args_size against limit (accounting for all the pointers and
+    // a minimum process stack size).
+    stack_end -= (args_size + 7) / 8;
+    char *data_start = (char *)stack_end;
+
+    *--stack_end = AT_NULL;
+    for (int i = auxc; i--;) {
+        auxv_t a = auxv[i];
+        switch (a.a_type) {
+        case AT_RANDOM:
+            syscall(__NR_getrandom, data_start, 16, 0);
+            data_start += 16;
+            break;
+        case AT_EXECFN:
+        case AT_PLATFORM:
+            // skip for now, since we haven't copied the data
+            continue;
+        // May be incorrect for the process we're starting. Should move this
+        // filtering somewhere else so we also have a place where we'd fill
+        // these in for the benefit of the dynamic linker.
+        case AT_PHDR:
+        case AT_PHENT:
+        case AT_PHNUM:
+        case AT_BASE:
+        case AT_ENTRY:
+            continue;
+        }
+        printf("forwarding auxv %ld (%s): %p\n", a.a_type, get_atype_name(a.a_type), a.a_ptr);
+        *--stack_end = a.a_val;
+        *--stack_end = a.a_type;
+    }
+
+    // envp
+    *--stack_end = 0;
+    for (int i = envc; i--;) {
+        *--stack_end = (u64)data_start;
+        const size_t n = strlen(envp[i]) + 1;
+        memcpy(data_start, envp[i], n);
+        data_start += n;
+    }
+
+    // argv
+    *--stack_end = 0;
+    for (int i = argc; i--;) {
+
+        *--stack_end = (u64)data_start;
+        const size_t n = strlen(argv[i]) + 1;
+        memcpy(data_start, argv[i], n);
+        data_start += n;
+    }
+    *--stack_end = argc;
+
+    return stack_end;
+}
+
+static auxv_t* find_auxv(char** envp) {
+    while (*envp++) /* find end of envp list */;
+    return (auxv_t*)envp;
 }
 
 int el_memexecve(const void *const buf, const size_t size, char *const*const argv, char *const*const envp) {
@@ -196,6 +346,19 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
         RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
     }
 
+    void *stack_start = mmap(0, STACK_SIZE, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    if (stack_start == MAP_FAILED) {
+        EXIT_ERRNO(errno, "mmap stack failed");
+    }
+    void *stack_end = (char*)stack_start + STACK_SIZE;
+
+    stack_end = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ));
+    if (!stack_end) {
+        munmap(stack_start, STACK_SIZE);
+        EXIT_ERRNO(E2BIG, "Command line/environment too big");
+    }
+    printf("Generated %zu bytes of argument/environment data\n", stack_start + STACK_SIZE - stack_end);
+
     // Point of no return: If we fail from now on we can only just _exit(1).
     // After this we have actually unmapped part of the previous process.
     if (munmap((void*)start, end - start)) {
@@ -237,12 +400,6 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
             mprotect(dest, phdr->p_memsz, prot_from_flags(phdr->p_flags));
         }
     }
-
-    void *stack_start = mmap(0, STACK_SIZE, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
-    if (stack_start == MAP_FAILED) {
-        EXIT_ERRNO(errno, "mmap stack failed");
-    }
-    void *stack_end = (char*)stack_start + STACK_SIZE;
 
     // Unmap everything we don't want anymore, e.g. everything except:
     // - new program's stack
