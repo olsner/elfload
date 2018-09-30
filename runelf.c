@@ -11,7 +11,7 @@ static int usage(const char *me) {
 }
 
 int main(int argc, char *const argv[]) {
-    if (argc > 2) {
+    if (argc > 1) {
         if (el_execve(argv[1], argv + 1, environ)) {
             perror("el_execve");
             return EXIT_FAILURE;
