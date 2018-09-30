@@ -20,7 +20,7 @@ SOURCES := runelf.c elfload.c
 LIB_SOURCES := elfload.c
 OBJECTS := $(SOURCES:%.c=$(OUTDIR)/%.o)
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OUTDIR)/%.o)
-BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true)
+BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true true-asm)
 LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
 CCACHE ?= #ccache
@@ -53,5 +53,9 @@ $(OUTDIR)/%.o: %.c
 $(OUTDIR)/true: true.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_CC)
+
+$(OUTDIR)/true-asm: true-asm.S
+	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
+	$(SIZE_AS)
 
 -include $(OBJECTS:.o=.d)
