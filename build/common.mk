@@ -27,6 +27,7 @@ HUSH_OBJCOPY= @echo ' [OBJCOPY]\t'$@;
 
 SIZE_ASM=@echo ' [ASM]\t'$@: `$(FILE_SIZE) $@` bytes
 SIZE_AR=@echo ' [AR]\t'$@: `$(FILE_SIZE) $@` bytes
+SIZE_CC= @echo ' [CC]\t'$@: `$(FILE_SIZE) $@` bytes
 SIZE_LD= @echo ' [LD]\t'$@: `$(FILE_SIZE) $@` bytes
 SIZE_OBJCOPY= @echo ' [OBJCOPY]\t'$@: `$(FILE_SIZE) $@` bytes
 endif

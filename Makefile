@@ -7,6 +7,7 @@ OUTDIR ?= out
 CFLAGS := -std=gnu11
 CFLAGS += -g -Os -march=native
 CFLAGS += -ffunction-sections -fdata-sections
+CFLAGS += -fPIC
 
 CFLAGS += -W -Wall -Wextra -Werror
 CFLAGS += -Wstrict-prototypes -Wmissing-prototypes
@@ -19,6 +20,8 @@ SOURCES := runelf.c elfload.c
 LIB_SOURCES := elfload.c
 OBJECTS := $(SOURCES:%.c=$(OUTDIR)/%.o)
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OUTDIR)/%.o)
+BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true)
+LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
 CCACHE ?= #ccache
 CC := $(CCACHE) $(CC)
@@ -26,13 +29,17 @@ CXX := $(CCACHE) $(CXX)
 
 default: all
 
-all: $(OUTDIR)/runelf $(OUTDIR)/libelfload.a
+all: $(BINARIES) $(LIBRARIES)
 
 clean:
 	rm -fr out
 
 $(OUTDIR)/runelf: $(OUTDIR)/runelf.o $(OUTDIR)/libelfload.a
 	$(HUSH_LD) $(CC) $(LDFLAGS) -o $@ $< -lelfload
+	$(SIZE_LD)
+
+$(OUTDIR)/runelf-pie: $(OUTDIR)/runelf.o $(OUTDIR)/libelfload.a
+	$(HUSH_LD) $(CC) $(LDFLAGS) -pie -o $@ $< -lelfload
 	$(SIZE_LD)
 
 $(OUTDIR)/libelfload.a: $(LIB_OBJECTS)
@@ -42,5 +49,9 @@ $(OUTDIR)/libelfload.a: $(LIB_OBJECTS)
 $(OUTDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(HUSH_CC) $(CC) $(CFLAGS) -c -MP -MMD -o $@ $<
+
+$(OUTDIR)/true: true.c
+	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
+	$(SIZE_CC)
 
 -include $(OBJECTS:.o=.d)
