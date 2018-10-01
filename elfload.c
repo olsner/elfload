@@ -167,7 +167,11 @@ static int invalid_elf_file(const uint8_t* const bytes, const size_t size) {
     CHECK_SIZE(sizeof(Elf64_Ehdr));
     GETHEADER(ehdr, Ehdr, 0);
 
-    // Are dynamically linked executables still ET_EXEC and not ET_DYN?
+    // Static: ET_EXEC
+    // Dynamic: ET_EXEC with PT_INTERP pointing to (e.g.) ld-linux.so
+    // Dynamic PIE: ET_DYN with PT_INTERP
+    // Static PIE: ET_DYN without PT_INTERP
+    // Interpreter: ET_DYN without PT_INTERP (no recursive interpretation??)
     if (ehdr->e_type != ET_EXEC) {
         RETURN_ERRNO(EINVAL, "ELF type not executable");
     }

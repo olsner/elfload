@@ -11,7 +11,7 @@ _start:
     /* write(1, msg, sizeof(msg));
      */
     movl $1, %edi
-    leaq (msg), %rsi
+    leaq msg(%rip), %rsi
     movl $msg_size, %edx
     movl $__NR_write, %eax
     syscall

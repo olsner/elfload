@@ -20,7 +20,7 @@ SOURCES := runelf.c elfload.c
 LIB_SOURCES := elfload.c
 OBJECTS := $(SOURCES:%.c=$(OUTDIR)/%.o)
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OUTDIR)/%.o)
-BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true true-asm)
+BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true true-asm true-pie true-dynamic true-asm-pie)
 LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
 CCACHE ?= #ccache
@@ -54,8 +54,23 @@ $(OUTDIR)/true: true.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
+$(OUTDIR)/true-pie: true.c
+	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -pie -MP -MMD -o $@ $<
+	$(SIZE_CC)
+
+$(OUTDIR)/true-dynamic: true.c
+	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -MP -MMD -o $@ $<
+	$(SIZE_CC)
+
 $(OUTDIR)/true-asm: true-asm.S
 	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
+	$(SIZE_AS)
+
+# Kind of similar to what GCC passes to the linker when -static-pie, based on
+# https://github.com/gcc-mirror/gcc/commit/6d1ab23dc1fbc5cc0fde2d9d4e01026bf099a333
+STATIC_PIE_LDFLAGS = -Wl,-static,-pie,--no-dynamic-linker,-z,text,-z,max-page-size=4096
+$(OUTDIR)/true-asm-pie: true-asm.S
+	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -fpie $(STATIC_PIE_LDFLAGS) -MP -MMD -o $@ $<
 	$(SIZE_AS)
 
 -include $(OBJECTS:.o=.d)
