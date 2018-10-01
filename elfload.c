@@ -26,7 +26,7 @@ typedef struct auxv_t {
 extern char **environ;
 #define PAGE_SIZE 4096
 #define NORETURN __attribute__((noreturn))
-#define STACK_SIZE (4 * 1024 * 1024)
+#define DEFAULT_STACK_SIZE (4 * 1024 * 1024)
 
 #define CASE(e) case e: return #e
 static const char *get_ptype_name(int ptype) {
@@ -308,6 +308,7 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     Elf64_Addr start = UINT64_MAX, end = 0;
     int found_interpreter = 0;
     int stack_prot = PROT_READ | PROT_WRITE;
+    int stack_size = DEFAULT_STACK_SIZE;
     for (int ph = 0; ph < ehdr->e_phnum; ph++) {
         const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
         GETHEADER(phdr, Phdr, phoff);
@@ -330,6 +331,8 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
         case PT_GNU_STACK:
             // How about a read-only or inaccessible stack? Seems ridiculous though :)
             if (phdr->p_flags & PF_X) stack_prot |= PROT_EXEC;
+            // TODO The size of the stack can be indicated using the p_memsz of
+            // this program header. Update stack_size if that size looks good.
             break;
         }
     }
@@ -346,18 +349,18 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
         RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
     }
 
-    void *stack_start = mmap(0, STACK_SIZE, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+    void *stack_start = mmap(0, stack_size, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack_start == MAP_FAILED) {
         EXIT_ERRNO(errno, "mmap stack failed");
     }
-    void *stack_end = (char*)stack_start + STACK_SIZE;
+    void *stack_end = (char*)stack_start + stack_size;
 
     stack_end = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ));
     if (!stack_end) {
-        munmap(stack_start, STACK_SIZE);
+        munmap(stack_start, stack_size);
         EXIT_ERRNO(E2BIG, "Command line/environment too big");
     }
-    printf("Generated %zu bytes of argument/environment data\n", stack_start + STACK_SIZE - stack_end);
+    printf("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_end);
 
     // Point of no return: If we fail from now on we can only just _exit(1).
     // After this we have actually unmapped part of the previous process.
@@ -415,7 +418,6 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     // Is it possible to modify the /proc/self/exe link?
 
     printf("Jumping to entry point %lx\n", ehdr->e_entry);
-    // Any other registers of interest?
     switch_to(stack_end, ehdr->e_entry);
 }
 
