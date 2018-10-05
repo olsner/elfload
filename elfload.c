@@ -50,40 +50,40 @@ static const char *get_ptype_name(int ptype) {
 }
 static const char *get_atype_name(int atype) {
     switch (atype) {
-CASE(AT_NULL);
-CASE(AT_IGNORE);
-CASE(AT_EXECFD);
-CASE(AT_PHDR);
-CASE(AT_PHENT);
-CASE(AT_PHNUM);
-CASE(AT_PAGESZ);
-CASE(AT_BASE);
-CASE(AT_FLAGS);
-CASE(AT_ENTRY);
-CASE(AT_NOTELF);
-CASE(AT_UID);
-CASE(AT_EUID);
-CASE(AT_GID);
-CASE(AT_EGID);
-CASE(AT_CLKTCK);
-CASE(AT_PLATFORM);
-CASE(AT_HWCAP);
-CASE(AT_FPUCW);
-CASE(AT_DCACHEBSIZE);
-CASE(AT_ICACHEBSIZE);
-CASE(AT_UCACHEBSIZE);
-CASE(AT_IGNOREPPC);
-CASE(AT_SECURE);
-CASE(AT_BASE_PLATFORM);
-CASE(AT_RANDOM);
-CASE(AT_HWCAP2);
-CASE(AT_EXECFN);
-CASE(AT_SYSINFO);
-CASE(AT_SYSINFO_EHDR);
-CASE(AT_L1I_CACHESHAPE);
-CASE(AT_L1D_CACHESHAPE);
-CASE(AT_L2_CACHESHAPE);
-CASE(AT_L3_CACHESHAPE);
+        CASE(AT_NULL);
+        CASE(AT_IGNORE);
+        CASE(AT_EXECFD);
+        CASE(AT_PHDR);
+        CASE(AT_PHENT);
+        CASE(AT_PHNUM);
+        CASE(AT_PAGESZ);
+        CASE(AT_BASE);
+        CASE(AT_FLAGS);
+        CASE(AT_ENTRY);
+        CASE(AT_NOTELF);
+        CASE(AT_UID);
+        CASE(AT_EUID);
+        CASE(AT_GID);
+        CASE(AT_EGID);
+        CASE(AT_CLKTCK);
+        CASE(AT_PLATFORM);
+        CASE(AT_HWCAP);
+        CASE(AT_FPUCW);
+        CASE(AT_DCACHEBSIZE);
+        CASE(AT_ICACHEBSIZE);
+        CASE(AT_UCACHEBSIZE);
+        CASE(AT_IGNOREPPC);
+        CASE(AT_SECURE);
+        CASE(AT_BASE_PLATFORM);
+        CASE(AT_RANDOM);
+        CASE(AT_HWCAP2);
+        CASE(AT_EXECFN);
+        CASE(AT_SYSINFO);
+        CASE(AT_SYSINFO_EHDR);
+        CASE(AT_L1I_CACHESHAPE);
+        CASE(AT_L1D_CACHESHAPE);
+        CASE(AT_L2_CACHESHAPE);
+        CASE(AT_L3_CACHESHAPE);
     default: return "unknown";
     }
 }
@@ -124,17 +124,17 @@ static int relocate_to(uintptr_t target) {
     unimpl("relocate_to");
 }
 
-static int check_relocate(Elf64_Addr start, Elf64_Addr end, const void *bytes, uintptr_t size) {
+static int check_relocate(Elf64_Addr loadstart, Elf64_Addr loadend, const void *bytes, uintptr_t size) {
     // Perhaps split up into another function for the "rest" that is explicitly relocatable.
-    if (no_overlap(start, end, &el_memexecve, SELF_SIZE) && no_overlap(start, end, bytes, size)) {
+    if (no_overlap(loadstart, loadend, &el_memexecve, SELF_SIZE) && no_overlap(loadstart, loadend, bytes, size)) {
         // TODO Do relocation anyway so that we force it to be tested
         printf("Sweet! no relocation necessary!\n");
         return 0;
-    } else if (start > 0x100000 + SELF_SIZE) {
+    } else if (loadstart > 0x100000 + SELF_SIZE) {
         // TODO Relocate the program too? It could probably be done on the fly while loading though.
-        return relocate_to(start - SELF_SIZE);
-    } else if (end < USER_VADDR_END - SELF_SIZE) {
-        return relocate_to(end);
+        return relocate_to(loadstart - SELF_SIZE);
+    } else if (loadend < USER_VADDR_END - SELF_SIZE) {
+        return relocate_to(loadend);
     } else {
         return 1;
     }
@@ -309,7 +309,7 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     }
 
     GETHEADER(ehdr, Ehdr, 0);
-    Elf64_Addr start = UINT64_MAX, end = 0;
+    Elf64_Addr loadstart = UINT64_MAX, loadend = 0;
     int found_interpreter = 0;
     int stack_prot = PROT_READ | PROT_WRITE;
     int stack_size = DEFAULT_STACK_SIZE;
@@ -329,8 +329,8 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
             // too, but provide our own interpreter for those. Then we should
             // have a clean way to handle both cases?
         case PT_LOAD:
-            start = MIN(phdr->p_vaddr, start);
-            end = MAX(phdr->p_vaddr + phdr->p_memsz, end);
+            loadstart = MIN(phdr->p_vaddr, loadstart);
+            loadend = MAX(phdr->p_vaddr + phdr->p_memsz, loadend);
             break;
         case PT_GNU_STACK:
             // How about a read-only or inaccessible stack? Seems ridiculous though :)
@@ -343,16 +343,20 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     if (found_interpreter) {
         RETURN_ERRNO(EINVAL, "Interpreted ELF files not supported yet");
     }
-    if (end <= start) {
+    if (loadend <= loadstart) {
         RETURN_ERRNO(EINVAL, "Nothing to load");
     }
     printf("Load addresses at %lx..%lx, self at %p, data at %p..%p\n",
-            start, end, &el_memexecve, bytes, bytes + size);
-    // TODO Check if we need to relocate the stack too
-    if (check_relocate(start, end, bytes, size)) {
+            loadstart, loadend, &el_memexecve, bytes, bytes + size);
+
+    if (check_relocate(loadstart, loadend, bytes, size)) {
         RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
     }
 
+    // FIXME Make sure this doesn't overlap where we're about to put anything
+    // either. Should probably go before relocate so we know we don't need
+    // anything at all from the old address space (except the loader code
+    // itself). We can move the stack if it does though, it's a single big block.
     void *stack_start = mmap(0, stack_size, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack_start == MAP_FAILED) {
         EXIT_ERRNO(errno, "mmap stack failed");
@@ -367,8 +371,8 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     printf("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_end);
 
     // Point of no return: If we fail from now on we can only just _exit(1).
-    // After this we have actually unmapped part of the previous process.
-    if (munmap((void*)start, end - start)) {
+    // After this we may have actually unmapped part of the previous process.
+    if (munmap((void*)loadstart, loadend - loadstart)) {
         EXIT_ERRNO(errno, "munmap failed");
     }
 
