@@ -126,7 +126,7 @@ static int relocate_to(uintptr_t target) {
 
 static int check_relocate(Elf64_Addr loadstart, Elf64_Addr loadend, const void *bytes, uintptr_t size) {
     // Perhaps split up into another function for the "rest" that is explicitly relocatable.
-    if (no_overlap(loadstart, loadend, &el_memexecve, SELF_SIZE) && no_overlap(loadstart, loadend, bytes, size)) {
+    if (no_overlap(loadstart, loadend, &el_fexecve, SELF_SIZE) && no_overlap(loadstart, loadend, bytes, size)) {
         // TODO Do relocation anyway so that we force it to be tested
         printf("Sweet! no relocation necessary!\n");
         return 0;
@@ -300,7 +300,28 @@ static auxv_t* find_auxv(char** envp) {
     return (auxv_t*)envp;
 }
 
-int el_memexecve(const void *const buf, const size_t size, char *const*const argv, char *const*const envp) {
+static size_t fsize(int fd) {
+    struct stat st;
+    if (fstat(fd, &st)) {
+        return -1;
+    }
+    return st.st_size;
+}
+
+/**
+ * Like with fexecve, the FD_CLOEXEC flag should usually be set on the executable.
+ */
+int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
+    const size_t size = fsize(fd);
+
+    // Mapped PROT_READ initially. we'll remap the pages with appropriate
+    // protections in the load part, this is just for reading the headers.
+    // Could avoid mapping the whole file if we wanted to.
+    void* buf = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (buf == MAP_FAILED) {
+        return -1;
+    }
+
     const uint8_t* const bytes = (const uint8_t *)buf;
     CHECK_SIZE(EI_NIDENT);
 
@@ -347,7 +368,7 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
         RETURN_ERRNO(EINVAL, "Nothing to load");
     }
     printf("Load addresses at %lx..%lx, self at %p, data at %p..%p\n",
-            loadstart, loadend, &el_memexecve, bytes, bytes + size);
+            loadstart, loadend, &el_fexecve, bytes, bytes + size);
 
     if (check_relocate(loadstart, loadend, bytes, size)) {
         RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
@@ -429,29 +450,6 @@ int el_memexecve(const void *const buf, const size_t size, char *const*const arg
     switch_to(stack_end, ehdr->e_entry);
 }
 
-/**
- * Like with fexecve, the FD_CLOEXEC flag should usually be set on the executable.
- */
-int el_fexecve(int fd, char *const argv[], char *const envp[]) {
-    struct stat st;
-    if (fstat(fd, &st)) {
-        return -1;
-    }
-
-    // Mapped PROT_READ initially. memexecve will remap the pages with appropriate protections.
-    void* mem = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mem == MAP_FAILED) {
-        return -1;
-    }
-
-    if (el_memexecve(mem, st.st_size, argv, envp)) {
-        munmap(mem, st.st_size);
-        return -1;
-    }
-
-    // memexecve may never return successfully
-    abort();
-}
 int el_execatve(int cwd, const char *path, char *const argv[], char *const envp[]) {
     int fd = openat(cwd, path, O_CLOEXEC | O_RDONLY);
     if (fd < 0) {
