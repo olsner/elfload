@@ -27,9 +27,12 @@ CCACHE ?= #ccache
 CC := $(CCACHE) $(CC)
 CXX := $(CCACHE) $(CXX)
 
-default: all
+default: all test
 
 all: $(BINARIES) $(LIBRARIES)
+
+test: all
+	cd test && ./test.sh
 
 clean:
 	rm -fr out

@@ -278,6 +278,7 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
 
     // TODO Check args_size against limit (accounting for all the pointers and
     // a minimum process stack size).
+    // FIXME Make sure the last %rsp is aligned
     stack_end -= (args_size + 7) / 8;
     char *data_start = (char *)stack_end;
 
