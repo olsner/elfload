@@ -130,7 +130,12 @@ static NORETURN void exit_errno(const char *file, int line, const char *why, int
     debug_printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
     _exit(1);
 }
+static NORETURN void assert_failed(const char *file, int line, const char *what) {
+    debug_printf("%s:%d: assertion failed: %s\n", file, line, what);
+    _exit(1);
+}
 
+#define assert(x) do { if (!(x)) assert_failed(__FILE__, __LINE__, #x); } while (0)
 #if 1
 #define CHECK_SIZE(n) do { if (n > size) RETURN_ERRNO(EINVAL, "Value out of range"); } while (0)
 #else
@@ -236,6 +241,12 @@ static NORETURN void switch_to(void* stack, uintptr_t rip) {
     abort();
 }
 
+static size_t copy_str(void* dst, const char* src) {
+    const size_t n = strlen(src) + 1;
+    memcpy(dst, src, n);
+    return n;
+}
+
 // Stack on entry:
 // [from %rsp and increasing addresses!]
 // argc
@@ -248,7 +259,7 @@ static NORETURN void switch_to(void* stack, uintptr_t rip) {
 //
 // Remaining space may be used to copy the environment, arguments and aux
 // vector information.
-static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, auxv_t* auxv) {
+static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, const auxv_t* auxv) {
     size_t args_size = 0;
     size_t argc = 0, envc = 0, auxc = 0;
 
@@ -263,9 +274,8 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     }
     // For now, assume that the aux vector is always built by copying the one
     // for the current process. In reality, it's filled in by the kernel.
-    for (auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
+    for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
         debug("input auxv %ld (%s): %p\n", auxp->a_type, get_atype_name(auxp->a_type), auxp->a_ptr);
-        auxc++;
         switch (auxp->a_type) {
         case AT_RANDOM:
             args_size += 16;
@@ -273,27 +283,47 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
         case AT_PLATFORM:
             args_size += strlen(auxp->a_str) + 1;
             break;
+        // Skipped below, so skip over here to get the correct auxc
+        case AT_EXECFN:
+        case AT_PHDR:
+        case AT_PHENT:
+        case AT_PHNUM:
+        case AT_BASE:
+        case AT_ENTRY:
+            continue;
         }
+        auxc++;
     }
 
     // TODO Check args_size against limit (accounting for all the pointers and
     // a minimum process stack size).
-    // FIXME Make sure the last %rsp is aligned
     stack_end -= (args_size + 7) / 8;
+
+    const size_t stack_words = (1 + 2 * auxc) + (1 + envc) + (1 + argc) + 1;
+    // If we have an odd number of words left to push and the stack is
+    // currently 16 byte aligned, misalign the stack by 8 bytes.
+    // And vice versa.
+    if (!(stack_words & 1) != !((uintptr_t)stack_end & 8)) {
+        stack_end--;
+    }
+    // TODO Since we've calculated the number of words we need now, we could
+    // fill in the data forwards instead of backwards.
     char *data_start = (char *)stack_end;
 
     *--stack_end = AT_NULL;
-    for (int i = auxc; i--;) {
-        auxv_t a = auxv[i];
-        switch (a.a_type) {
+    for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
+        auxv_t a = *auxp;
+        switch (auxp->a_type) {
         case AT_RANDOM:
+            a.a_ptr = data_start;
             syscall(__NR_getrandom, data_start, 16, 0);
             data_start += 16;
             break;
-        case AT_EXECFN:
         case AT_PLATFORM:
-            // skip for now, since we haven't copied the data
-            continue;
+            a.a_ptr = data_start;
+            data_start += copy_str(data_start, auxp->a_str);
+            break;
+        case AT_EXECFN:
         // May be incorrect for the process we're starting. Should move this
         // filtering somewhere else so we also have a place where we'd fill
         // these in for the benefit of the dynamic linker.
@@ -313,21 +343,19 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     *--stack_end = 0;
     for (int i = envc; i--;) {
         *--stack_end = (u64)data_start;
-        const size_t n = strlen(envp[i]) + 1;
-        memcpy(data_start, envp[i], n);
-        data_start += n;
+        data_start += copy_str(data_start, envp[i]);
     }
 
     // argv
     *--stack_end = 0;
     for (int i = argc; i--;) {
-
         *--stack_end = (u64)data_start;
-        const size_t n = strlen(argv[i]) + 1;
-        memcpy(data_start, argv[i], n);
-        data_start += n;
+        data_start += copy_str(data_start, argv[i]);
     }
     *--stack_end = argc;
+
+    // Stack must be 16 byte aligned on entry
+    assert(!((uintptr_t)stack_end & 15));
 
     return stack_end;
 }

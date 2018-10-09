@@ -1,9 +1,32 @@
 #!/bin/bash
 
+###############################################################################
+# Actual tests
+
+test_stackalign() {
+    compile_asm stackalign.S
+    testenv+=( foo=bar )
+    check "$runelf" "$out"
+    check "$runelf" "$out" arg1
+    check "$runelf" "$out" arg1longersdf
+    testenv+=( foo=bar bar=baz )
+    check "$runelf" "$out" arg1 longersdf
+    check "$runelf" "$out" arg1
+    check "$runelf" "$out"
+}
+test_true() {
+    compile_asm true.S
+    check "$runelf" "$out"
+}
+
+###############################################################################
+# Internal functions
+
 # runtest TESTFUN
 runtest() {
-    local out=`mktemp -p tmp XXXXXX`
+    local testenv=( )
     local testfun="$1"
+    local out="tmp/$testfun"
     local failed_checks=0
     if "$@" && (( failed_checks == 0 )); then
         echo "$testfun: OK"
@@ -12,7 +35,6 @@ runtest() {
         echo "$testfun: $failed_checks checks failed"
         let fail=fail+1
     fi
-    rm -f "$out"
     return 0
 }
 compile_asm() {
@@ -23,31 +45,20 @@ check() {
     if (( strace )); then
         cmd=( strace "$@" )
     fi
-    if "${cmd[@]}"; then
+    if env -i "${testenv[@]}" "${cmd[@]}"; then
         if (( v )); then
-            echo "PASS: in $testfun: $@ exited with status=$?"
+            echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) exited with status=$?"
         fi
     else
-        echo "FAIL: in $testfun: $@ failed with status=$?"
+        echo "FAIL: in $testfun: \"$@\" (with ${testenv[@]}) failed with status=$?"
         (( failed_checks++ ))
         return 1
     fi
 }
 
-# Actual tests
-test_stackalign() {
-    compile_asm stackalign.S
-# TODO Stack alignment isn't correctly implemented yet.
-#    check "$runelf" "$out"
-#    check "$runelf" "$out" arg1
-#    check "$runelf" "$out" arg1longersdf
-}
-test_true() {
-    compile_asm true.S
-    check "$runelf" "$out"
-}
-
+###############################################################################
 # Entry point and test runner
+
 mkdir -p tmp
 runelf=../out/runelf-pie
 pass=0
