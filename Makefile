@@ -20,7 +20,7 @@ SOURCES := runelf.c elfload.c
 LIB_SOURCES := elfload.c
 OBJECTS := $(SOURCES:%.c=$(OUTDIR)/%.o)
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OUTDIR)/%.o)
-BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie true true-asm true-pie true-dynamic true-asm-pie)
+BINARIES := $(addprefix $(OUTDIR)/, runelf runelf-pie hello hello-asm hello-pie hello-dynamic hello-asm-pie)
 LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
 CCACHE ?= #ccache
@@ -53,26 +53,26 @@ $(OUTDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(HUSH_CC) $(CC) $(CFLAGS) -c -MP -MMD -o $@ $<
 
-$(OUTDIR)/true: true.c
+$(OUTDIR)/hello: hello.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/true-pie: true.c
+$(OUTDIR)/hello-pie: hello.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -pie -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/true-dynamic: true.c
+$(OUTDIR)/hello-dynamic: hello.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/true-asm: true-asm.S
+$(OUTDIR)/hello-asm: hello-asm.S
 	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_AS)
 
 # Kind of similar to what GCC passes to the linker when -static-pie, based on
 # https://github.com/gcc-mirror/gcc/commit/6d1ab23dc1fbc5cc0fde2d9d4e01026bf099a333
 STATIC_PIE_LDFLAGS = -Wl,-static,-pie,--no-dynamic-linker,-z,text,-z,max-page-size=4096
-$(OUTDIR)/true-asm-pie: true-asm.S
+$(OUTDIR)/hello-asm-pie: hello-asm.S
 	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -fpie $(STATIC_PIE_LDFLAGS) -MP -MMD -o $@ $<
 	$(SIZE_AS)
 
