@@ -30,8 +30,9 @@ extern char **environ;
 #define PAGE_SIZE 4096
 #define NORETURN __attribute__((noreturn))
 #define DEFAULT_STACK_SIZE (4 * 1024 * 1024)
-// Note with 5-level page tables, this goes up to 1<<56 (minus one page). How do we check for that feature from user space?
-static const uintptr_t USERSPACE_END = (1ull << 47) - PAGE_SIZE;
+// Note with 5-level page tables, this goes up to 1<<56 (minus one page). How
+// do we check for that feature from user space?
+static const uintptr_t USER_VADDR_END = (1ull << 47) - PAGE_SIZE;
 
 #if enable_debug
 #define debug_printf(fmt, ...) printf(fmt, ## __VA_ARGS__)
@@ -145,7 +146,6 @@ static NORETURN void assert_failed(const char *file, int line, const char *what)
 #define EXIT_ERRNO(err, why) exit_errno(__FILE__, __LINE__, why, err)
 #define GETHEADER(name, type, offset) CHECK_SIZE(offset + sizeof(Elf64_##type)); const Elf64_##type *name = (const Elf64_##type *)&bytes[offset]
 #define SELF_SIZE 4096
-#define USER_VADDR_END ((1ull << 47) - 1)
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 
@@ -575,20 +575,29 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     switch_to(stack_ptr, entrypoint);
 }
 
-int el_execatve(int cwd, const char *path, char *const argv[], char *const envp[]) {
-    int fd = openat(cwd, path, O_CLOEXEC | O_RDONLY);
+int el_execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags) {
+    int oflags = O_CLOEXEC | O_RDONLY;
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        oflags |= O_NOFOLLOW;
+    }
+
+    bool use_dirfd = false;
+    if ((flags & AT_EMPTY_PATH) && !*path) {
+        use_dirfd = true;
+    }
+
+    const int fd = use_dirfd ? dirfd : openat(dirfd, path, oflags);
     if (fd < 0) {
         return -1;
     }
 
-    if (el_fexecve(fd, argv, envp)) {
-        close(fd);
-        return -1;
-    }
+    el_fexecve(fd, argv, envp);
 
-    // el_fexecve may never return successfully
-    abort();
+    // el_fexecve may never return successfully, so this is some kind of error
+    // regardless of what fexecve returned.
+    close(fd);
+    return -1;
 }
 int el_execve(const char *path, char *const argv[], char *const envp[]) {
-    return el_execatve(AT_FDCWD, path, argv, envp);
+    return el_execveat(AT_FDCWD, path, argv, envp, 0);
 }

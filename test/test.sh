@@ -73,6 +73,7 @@ for f in "${funs[@]}"; do
     runtest "$f"
 done
 
+echo
 echo "PASS: $pass"
 echo "FAIL: $fail"
 exit $fail
