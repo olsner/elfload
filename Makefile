@@ -14,7 +14,7 @@ CFLAGS += -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS += -Wmissing-include-dirs
 CFLAGS += -Wno-unused-function -Wno-unused-parameter
 
-LDFLAGS := -Wl,--gc-sections -L$(OUTDIR)
+LDFLAGS = -g -Wl,--gc-sections -L$(OUTDIR) -Wl,-Map,$@.map
 
 SOURCES := runelf.c elfload.c
 LIB_SOURCES := elfload.c
