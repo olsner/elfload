@@ -491,13 +491,13 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         GETHEADER(phdr, Phdr, phoff);
 
         if (phdr->p_type == PT_LOAD) {
-            u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
-            u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
-            u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
+            const u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
+            const u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
+            const u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
 
-            u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
-            u64 file_page = phdr->p_offset - file_offset;
-            u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
+            const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
+            const u64 file_page = phdr->p_offset - file_offset;
+            const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
 
             if (file_offset != vaddr_offset) {
                 EXIT_ERRNO(errno, "Impossible file/vaddr offset mismatch");
@@ -514,13 +514,22 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
                 EXIT_ERRNO(errno, "mmap failed");
             }
 
-            // FIXME Needs to account for a partial last page, the remaining bit should be cleared.
-            // Needs a test suite :(
+            // TODO Add tests:
+            // - check that extra BSS pages are accessible and zeroed
+            // - check that the BSS part of the tail of the .data section is properly zeroed
             if (vaddr_size > file_size) {
+                debug("Mapping BSS %08lx..%08lx\n", vaddr_page + file_size, vaddr_page + vaddr_size);
                 if (mmap((void*)(vaddr_page + file_size), vaddr_size - file_size, prot,
                         MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0) == MAP_FAILED) {
                     EXIT_ERRNO(errno, "mmap failed");
                 }
+            }
+            if (phdr->p_memsz > phdr->p_filesz) {
+                const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
+                const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
+                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
+                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
+                memset((void*)vaddr_file_end, 0, clear_end - vaddr_file_end);
             }
         }
     }
