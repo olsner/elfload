@@ -1,10 +1,17 @@
+// Needed for unshare()
+#define _GNU_SOURCE
+
 #include "elfload.h"
 
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/prctl.h>
 #include <linux/random.h>
+#include <linux/sched.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -582,9 +589,61 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
             }
         }
     }
-    debug("Unmapping image %p..%p\n", bytes, bytes + size);
-    const Elf64_Addr entrypoint = ehdr->e_entry;
-    munmap((void*)bytes, size);
+
+    // Disable the alternate signal stack as mandated by POSIX (required also
+    // since the alternative stack might point into memory we're about to
+    // unmap).
+    {
+        stack_t ss;
+        ss.ss_flags = SS_DISABLE;
+        if (sigaltstack(&ss, NULL)) {
+            EXIT_ERRNO(errno, "sigaltstack");
+        }
+    }
+
+    // Reset signal dispositions for signals that are being caught. (the signal
+    // handlers will be unmapped...)
+    // POSIX.1 specifies that the dispositions of any signals that are ignored
+    // or set to the default are left unchanged.
+    {
+        struct sigaction oldact;
+        int max_sig = sizeof(oldact.sa_mask) * CHAR_BIT;
+        for (int i = 0; i < max_sig; i++) {
+            if (sigaction(i, NULL, &oldact)) {
+                debug("sigaction error %d (%s)\n", errno, strerror(errno));
+                continue;
+            }
+            if (oldact.sa_handler != SIG_DFL && oldact.sa_handler != SIG_IGN) {
+                memset(&oldact, 0, sizeof(oldact));
+                oldact.sa_handler = SIG_DFL;
+                if (sigaction(i, &oldact, NULL)) {
+                    EXIT_ERRNO(errno, "Resetting sigaction");
+                }
+            }
+        }
+    }
+
+    // Maybe also CLONE_SYSVSEM. The other unshare/clone flags seem to have to
+    // do with namespaces which exec doesn't affect.
+    // Make a test with vfork() to make sure the closing of CLOEXEC files does
+    // not affect the parent.
+    unshare(CLONE_FILES);
+
+    // Close CLOEXEC files (we may need to hold on to fd to pass it to an interpreter though)
+    //   See execveat/fexecve documentation about running file descriptors with interpreters though.
+    // Check what else kind of magic exec does to tear down the old process.
+    // See execve(2).
+    //
+    // POSIX:
+    // - mlock/mlockall memory locks are not preserved
+    // - the floating-point environment is reset
+    //
+    // Linux:
+    // - PR_SET_DUMPABLE is set
+    // - PR_SET_KEEPCAPS is cleared
+    // - PR_SET_NAME process name is reset to the executable name
+    // - SECBIT_KEEP_CAPS[securebits] is cleared
+    // - termination signal is reset to SIGCHLD
 
     // Unmap everything we don't want anymore, e.g. everything except:
     // - new program's stack
@@ -594,9 +653,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     // - the minimum necessary to jump into the new program
     //   though if the loader is less than one page, we could just keep the whole thing
 
-    // Close CLOEXEC files (we may need to hold on to fd to pass it to an interpreter though)
-    //   See execveat/fexecve documentation about running file descriptors with interpreters though.
-    // Check what else kind of magic exec does to tear down the old process.
+    debug("Unmapping image %p..%p\n", bytes, bytes + size);
+    const Elf64_Addr entrypoint = ehdr->e_entry;
+    munmap((void*)bytes, size);
 
     if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&mm_map, sizeof(mm_map), 0)) {
         EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
