@@ -3,6 +3,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/prctl.h>
 #include <linux/random.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <syscall.h>
 #include <unistd.h>
@@ -17,6 +19,7 @@
 #define enable_debug 0
 
 typedef uint64_t u64;
+typedef uint32_t u32;
 typedef uint8_t u8;
 typedef struct auxv_t {
     u64 a_type;
@@ -119,6 +122,9 @@ static NORETURN void raw_exit(int status) {
 static int raw_munmap(void *start, size_t length) {
     return syscall2(__NR_munmap, (u64)start, (u64)length);
 }
+static uintptr_t raw_brk(uintptr_t addr) {
+    return syscall2(__NR_brk, addr, 0);
+}
 
 static NORETURN void unimpl(const char *what) {
     printf("UNIMPL: %s\n", what);
@@ -128,7 +134,7 @@ static void debug_check(const char *file, int line, const char *why, int err) {
     debug_printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
 }
 static NORETURN void exit_errno(const char *file, int line, const char *why, int err) {
-    debug_printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
+    printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
     _exit(1);
 }
 static NORETURN void assert_failed(const char *file, int line, const char *what) {
@@ -259,7 +265,7 @@ static size_t copy_str(void* dst, const char* src) {
 //
 // Remaining space may be used to copy the environment, arguments and aux
 // vector information.
-static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, const auxv_t* auxv) {
+static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, const auxv_t* auxv, struct prctl_mm_map* mm_map) {
     size_t args_size = 0;
     size_t argc = 0, envc = 0, auxc = 0;
 
@@ -290,7 +296,7 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
         case AT_PHNUM:
         case AT_BASE:
         case AT_ENTRY:
-            continue;
+            break;
         }
         auxc++;
     }
@@ -299,7 +305,7 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     // a minimum process stack size).
     stack_end -= (args_size + 7) / 8;
 
-    const size_t stack_words = (1 + 2 * auxc) + (1 + envc) + (1 + argc) + 1;
+    const size_t stack_words = 2 * (1 + auxc) + (1 + envc) + (1 + argc) + 1;
     // If we have an odd number of words left to push and the stack is
     // currently 16 byte aligned, misalign the stack by 8 bytes.
     // And vice versa.
@@ -310,6 +316,7 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     // fill in the data forwards instead of backwards.
     char *data_start = (char *)stack_end;
 
+    *--stack_end = AT_NULL;
     *--stack_end = AT_NULL;
     for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
         auxv_t a = *auxp;
@@ -323,39 +330,49 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
             a.a_ptr = data_start;
             data_start += copy_str(data_start, auxp->a_str);
             break;
+        // May be incorrect for the process we're starting, so for now just
+        // clear them. (This is required since PR_SET_MM expects a full
+        // complement of auxv data.)
         case AT_EXECFN:
-        // May be incorrect for the process we're starting. Should move this
-        // filtering somewhere else so we also have a place where we'd fill
-        // these in for the benefit of the dynamic linker.
         case AT_PHDR:
         case AT_PHENT:
         case AT_PHNUM:
         case AT_BASE:
         case AT_ENTRY:
-            continue;
+            a.a_val = 0;
+            break;
         }
         debug("forwarding auxv %ld (%s): %p\n", a.a_type, get_atype_name(a.a_type), a.a_ptr);
         *--stack_end = a.a_val;
         *--stack_end = a.a_type;
     }
+    mm_map->auxv = (__u64*)stack_end;
+    // Includes the terminating null entries
+    mm_map->auxv_size = 2 * (1 + auxc);
 
     // envp
+    mm_map->env_end = (uintptr_t)stack_end;
     *--stack_end = 0;
     for (int i = envc; i--;) {
         *--stack_end = (u64)data_start;
         data_start += copy_str(data_start, envp[i]);
     }
+    mm_map->env_start = (uintptr_t)stack_end;
 
     // argv
+    mm_map->arg_end = (uintptr_t)stack_end;
     *--stack_end = 0;
     for (int i = argc; i--;) {
         *--stack_end = (u64)data_start;
         data_start += copy_str(data_start, argv[i]);
     }
     *--stack_end = argc;
+    mm_map->arg_start = (uintptr_t)stack_end;
 
     // Stack must be 16 byte aligned on entry
     assert(!((uintptr_t)stack_end & 15));
+
+    mm_map->start_stack = (uintptr_t)stack_end;
 
     return stack_end;
 }
@@ -455,6 +472,28 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
     }
 
+    // Must be strictly larger than end_data and start_data
+    const uintptr_t start_brk = (loadend + PAGE_SIZE) & -PAGE_SIZE;
+    struct prctl_mm_map mm_map = {
+        // TODO How are these calculated by Linux?
+        .start_code = loadstart,
+        .end_code = loadend - 1,
+        // start_data < end_data is required. I guess we should just track the
+        // executable/data split. Based on program header access flags?
+        .start_data = loadend - 1,
+        .end_data = loadend,
+        .start_brk = start_brk,
+        .brk = start_brk,
+        // stack, arg, env and auxv stuff is set in build_stack
+        .exe_fd = (u32)-1 // fd // Requires admin to modify apparently
+    };
+    unsigned int mm_map_size = 0;
+    if (prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&mm_map_size, 0, 0)) {
+        RETURN_ERRNO(errno, "Failed getting size of struct mm_map");
+    } else if (mm_map_size != sizeof(mm_map)) {
+        RETURN_ERRNO(ENOSYS, "Incompatible struct mm_map");
+    }
+
     uintptr_t vdso_start, vdso_end;
     get_vdso_range(&vdso_start, &vdso_end);
 
@@ -468,10 +507,10 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     }
     void *const stack_end = (char*)stack_start + stack_size;
 
-    void *const stack_ptr = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ));
+    void *const stack_ptr = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ), &mm_map);
     if (!stack_ptr) {
-        // TODO THis should happen before the point of no return.
-        EXIT_ERRNO(E2BIG, "Command line/environment too big");
+        // TODO Unmap anything we mapped before
+        RETURN_ERRNO(E2BIG, "Command line/environment too big");
     }
     debug("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_ptr);
 
@@ -546,11 +585,21 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     //   though if the loader is less than one page, we could just keep the whole thing
 
     // Close CLOEXEC files (we may need to hold on to fd to pass it to an interpreter though)
+    //   See execveat/fexecve documentation about running file descriptors with interpreters though.
     // Check what else kind of magic exec does to tear down the old process.
     //
     // Is it possible to modify the /proc/self/exe link?
     //  Yes! prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, ...)
     //  Hmm, although it can only be set once? Ew.
+    //  The setting once doesn't seem to actually be true, but it does require additional privileges.
+
+    if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&mm_map, sizeof(mm_map), 0)) {
+        EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
+
+        if (raw_brk(start_brk) != start_brk) {
+            EXIT_ERRNO(ENOMEM, "brk failed");
+        }
+    }
 
     const uintptr_t mypage = round_down(get_rip(), PAGE_SIZE);
     debug("Preparing to clean up virtual memory:\n");
