@@ -485,7 +485,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         .start_brk = start_brk,
         .brk = start_brk,
         // stack, arg, env and auxv stuff is set in build_stack
-        .exe_fd = (u32)-1 // fd // Requires admin to modify apparently
+        // Since exe_fd requires more privileges to modify, set it separately
+        // though PR_SET_MM_EXE_FILE so we can ignore failures.
+        .exe_fd = (u32)-1
     };
     unsigned int mm_map_size = 0;
     if (prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&mm_map_size, 0, 0)) {
@@ -587,18 +589,13 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     // Close CLOEXEC files (we may need to hold on to fd to pass it to an interpreter though)
     //   See execveat/fexecve documentation about running file descriptors with interpreters though.
     // Check what else kind of magic exec does to tear down the old process.
-    //
-    // Is it possible to modify the /proc/self/exe link?
-    //  Yes! prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, ...)
-    //  Hmm, although it can only be set once? Ew.
-    //  The setting once doesn't seem to actually be true, but it does require additional privileges.
 
     if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&mm_map, sizeof(mm_map), 0)) {
         EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
-
-        if (raw_brk(start_brk) != start_brk) {
-            EXIT_ERRNO(ENOMEM, "brk failed");
-        }
+    }
+    if (prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)) {
+        // Not an error, since this requires additional privileges for now ignore failures.
+        debug("PR_SET_MM_EXE_FILE failed\n");
     }
 
     const uintptr_t mypage = round_down(get_rip(), PAGE_SIZE);
