@@ -550,9 +550,11 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
                     vaddr_page, vaddr_page + vaddr_size);
 
             const int prot = prot_from_flags(phdr->p_flags);
-            if (mmap((void*)vaddr_page, file_size, prot,
-                    MAP_PRIVATE | MAP_FIXED, fd, file_page) == MAP_FAILED) {
-                EXIT_ERRNO(errno, "mmap failed");
+            if (file_size) {
+                if (mmap((void*)vaddr_page, file_size, prot,
+                            MAP_PRIVATE | MAP_FIXED, fd, file_page) == MAP_FAILED) {
+                    EXIT_ERRNO(errno, "mmap failed");
+                }
             }
 
             // TODO Add tests:
