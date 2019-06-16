@@ -4,19 +4,24 @@
 # Actual tests
 
 test_stackalign() {
-    compile_asm stackalign.S
+    compile stackalign.S
     testenv+=( foo=bar )
     check "$runelf" "$out"
     check "$runelf" "$out" arg1
     check "$runelf" "$out" arg1longersdf
+    check "$runelf" "$out" arg1 longersdf
     testenv+=( foo=bar bar=baz )
     check "$runelf" "$out" arg1 longersdf
     check "$runelf" "$out" arg1
     check "$runelf" "$out"
 }
 test_true() {
-    compile_asm true.S
+    compile true.S
     check "$runelf" "$out"
+}
+test_proc_cmdline() {
+    compile cat.c
+    check_output "$out\0/proc/self/cmdline\0" "$runelf" "$out" /proc/self/cmdline
 }
 
 ###############################################################################
@@ -37,8 +42,8 @@ runtest() {
     fi
     return 0
 }
-compile_asm() {
-    gcc  -nostdlib -static -o "$out" "$@"
+compile() {
+    gcc -g -nostdlib -static -ffreestanding -o "$out" "$@"
 }
 check() {
     local cmd=( "$@" )
@@ -46,6 +51,24 @@ check() {
         cmd=( strace "$@" )
     fi
     if env -i "${testenv[@]}" "${cmd[@]}"; then
+        if (( v )); then
+            echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) exited with status=$?"
+        fi
+    else
+        echo "FAIL: in $testfun: \"$@\" (with ${testenv[@]}) failed with status=$?"
+        (( failed_checks++ ))
+        return 1
+    fi
+}
+check_output() {
+    local refout=$1
+    shift
+    local cmd=( "$@" )
+    local outf="tmp/${testfun}.out"
+    local reff="tmp/${testfun}.ref"
+    echo -ne "$refout" >"$reff"
+    echo "env -i ${testenv[@]} ${cmd[@]} >$outf"
+    if env -i "${testenv[@]}" "${cmd[@]}" >"$outf" && cmp -s "$outf" "$reff"; then
         if (( v )); then
             echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) exited with status=$?"
         fi

@@ -351,6 +351,9 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     mm_map->auxv_size = 2 * (1 + auxc);
 
     // envp
+    // TODO Are the env_start/env_end pointers also suppose to point to the
+    // strings rather than the table of pointers to those strings? Probably.
+    // Should add some test cases for that.
     mm_map->env_end = (uintptr_t)stack_end;
     *--stack_end = 0;
     for (int i = envc; i--;) {
@@ -360,18 +363,22 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     mm_map->env_start = (uintptr_t)stack_end;
 
     // argv
-    mm_map->arg_end = (uintptr_t)stack_end;
     *--stack_end = 0;
-    for (int i = argc; i--;) {
-        *--stack_end = (u64)data_start;
+    const char** out_argv = (const char**)(stack_end -= argc);
+    // mm_map arg_start and arg_end are the list of null-terminated strings that are the arguments, in order.
+    mm_map->arg_start = (uintptr_t)data_start;
+    for (size_t i = 0; i < argc; i++) {
+        out_argv[i] = data_start;
         data_start += copy_str(data_start, argv[i]);
     }
+    mm_map->arg_end = (uintptr_t)data_start;
     *--stack_end = argc;
-    mm_map->arg_start = (uintptr_t)stack_end;
 
     // Stack must be 16 byte aligned on entry
     assert(!((uintptr_t)stack_end & 15));
 
+    // Is this supposed to be the lower address (i.e. the end of the stack), or
+    // the address where the stack starts out?
     mm_map->start_stack = (uintptr_t)stack_end;
 
     return stack_end;
