@@ -351,16 +351,15 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     mm_map->auxv_size = 2 * (1 + auxc);
 
     // envp
-    // TODO Are the env_start/env_end pointers also suppose to point to the
-    // strings rather than the table of pointers to those strings? Probably.
-    // Should add some test cases for that.
-    mm_map->env_end = (uintptr_t)stack_end;
     *--stack_end = 0;
-    for (int i = envc; i--;) {
-        *--stack_end = (u64)data_start;
+    const char** out_envp = (const char**)(stack_end -= envc);
+    // env_start..end is a list of null-terminated strings in the environment.
+    mm_map->env_start = (uintptr_t)data_start;
+    for (size_t i = 0; i < envc; i++) {
+        out_envp[i] = data_start;
         data_start += copy_str(data_start, envp[i]);
     }
-    mm_map->env_start = (uintptr_t)stack_end;
+    mm_map->env_end = (uintptr_t)data_start;
 
     // argv
     *--stack_end = 0;

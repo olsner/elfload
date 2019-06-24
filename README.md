@@ -41,4 +41,3 @@ MIT license, see COPYING for details.
 ## Untested features ##
 
 * Resetting of signal handlers on `exec()`
-* Contents of `/proc/self/environ`

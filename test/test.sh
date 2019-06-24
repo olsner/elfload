@@ -10,7 +10,7 @@ test_stackalign() {
     check "$runelf" "$out" arg1
     check "$runelf" "$out" arg1longersdf
     check "$runelf" "$out" arg1 longersdf
-    testenv+=( foo=bar bar=baz )
+    testenv+=( bar=baz )
     check "$runelf" "$out" arg1 longersdf
     check "$runelf" "$out" arg1
     check "$runelf" "$out"
@@ -21,7 +21,19 @@ test_true() {
 }
 test_proc_cmdline() {
     compile cat.c
+    check_output "$out\0/proc/self/cmdline\0" "$out" /proc/self/cmdline
     check_output "$out\0/proc/self/cmdline\0" "$runelf" "$out" /proc/self/cmdline
+}
+test_proc_environ() {
+    compile cat.c
+    check_output "" "$out" /proc/self/environ
+    check_output "" "$runelf" "$out" /proc/self/environ
+    testenv+=( foo=bar )
+    check_output "foo=bar\0" "$out" /proc/self/environ
+    check_output "foo=bar\0" "$runelf" "$out" /proc/self/environ
+    testenv+=( bar=baz )
+    check_output "foo=bar\0bar=baz\0" "$out" /proc/self/environ
+    check_output "foo=bar\0bar=baz\0" "$runelf" "$out" /proc/self/environ
 }
 
 ###############################################################################
