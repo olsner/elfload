@@ -13,7 +13,7 @@ itself.
 
 ## License ##
 
-MIT license, see COPYING for details.
+MIT license, see the file LICENSE for details.
 
 ## Known issues ##
 
