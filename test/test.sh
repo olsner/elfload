@@ -79,7 +79,6 @@ check_output() {
     local outf="tmp/${testfun}.out"
     local reff="tmp/${testfun}.ref"
     echo -ne "$refout" >"$reff"
-    echo "env -i ${testenv[@]} ${cmd[@]} >$outf"
     if env -i "${testenv[@]}" "${cmd[@]}" >"$outf" && cmp -s "$outf" "$reff"; then
         if (( v )); then
             echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) exited with status=$?"
