@@ -458,6 +458,9 @@ static void munmap_range(uintptr_t start, uintptr_t end) {
     }
 }
 
+static void reset_process(int keep_fd);
+NORETURN static void finish_load(int fd, const uint8_t* const bytes, const size_t size, u64 loadstart, u64 loadend, void* stack_ptr);
+
 /**
  * Like with fexecve, the FD_CLOEXEC flag should usually be set on the executable.
  */
@@ -544,9 +547,6 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         .exe_fd = (u32)-1
     };
     unsigned int mm_map_size = 0;
-    // TODO Since we lose attributes of the old process here, this should be
-    // considered the point of no return or at least happen after it. Is it
-    // necessary to do it this early?
     if (prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&mm_map_size, 0, 0)) {
         RETURN_ERRNO(errno, "Failed getting size of struct mm_map");
     } else if (mm_map_size != sizeof(mm_map)) {
@@ -571,63 +571,33 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     void *const stack_ptr = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ), &mm_map);
     debug("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_ptr);
 
-    // Point of no return: If we fail from now on we can only just _exit(1).
-    // After this we may have actually unmapped part of the previous process.
-    munmap_range(loadstart, loadend);
+    // From this point forward we'll start messing with the original process so
+    // we should exit rather than return, but we still have access to libc
+    // functions and e.g. errno since we haven't unampped anything yet.
 
-    // Would like to just mremap the stuff from where it's already mapped in memory anyway.
-    // But this needs to handle overlap in the ends of segments - e.g.
-    // code from 0x1000 to 0x17ff and data from 0x1800 on, which means that the
-    // data has to be copied (or the mapping duplicated) to its vaddr.
-    // Doesn't look like mremap readily supports this, but we can iterate first
-    // to find the overlapping pages and duplicate those while mremapping
-    // everything else.
-    for (int ph = 0; ph < ehdr->e_phnum; ph++) {
-        const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
-        GETHEADER(phdr, Phdr, phoff);
+    reset_process(fd);
 
-        if (phdr->p_type == PT_LOAD) {
-            const u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
-            const u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
-            const u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
-
-            const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
-            const u64 file_page = phdr->p_offset - file_offset;
-            const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
-
-            debug("Mapping %08lx..%08lx to %08lx..%08lx (%08lx..%08lx)\n",
-                    phdr->p_offset, phdr->p_offset + phdr->p_filesz,
-                    phdr->p_vaddr, phdr->p_vaddr + phdr->p_memsz,
-                    vaddr_page, vaddr_page + vaddr_size);
-
-            const int prot = prot_from_flags(phdr->p_flags);
-            if (file_size) {
-                if (mmap((void*)vaddr_page, file_size, prot,
-                            MAP_PRIVATE | MAP_FIXED, fd, file_page) == MAP_FAILED) {
-                    EXIT_ERRNO(errno, "mmap failed");
-                }
-            }
-
-            // TODO Add tests:
-            // - check that extra BSS pages are accessible and zeroed
-            // - check that the BSS part of the tail of the .data section is properly zeroed
-            if (vaddr_size > file_size) {
-                debug("Mapping BSS %08lx..%08lx\n", vaddr_page + file_size, vaddr_page + vaddr_size);
-                if (mmap((void*)(vaddr_page + file_size), vaddr_size - file_size, prot,
-                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0) == MAP_FAILED) {
-                    EXIT_ERRNO(errno, "mmap failed");
-                }
-            }
-            if (phdr->p_memsz > phdr->p_filesz) {
-                const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
-                const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
-                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
-                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
-                memset((void*)vaddr_file_end, 0, clear_end - vaddr_file_end);
-            }
-        }
+    if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&mm_map, sizeof(mm_map), 0)) {
+        EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
     }
 
+    munmap_range(loadstart, loadend);
+
+    // This is to keep track of the range of things (including the stack) that we need to keep around.
+    // This is pretty bad though, since the stack seems to end up near the end
+    // of address space, so we just preserve everything. Should be much more
+    // fine-grained.
+    loadstart = MIN(loadstart, (uintptr_t)stack_start);
+    loadend = MAX(loadend, (uintptr_t)stack_end);
+
+    finish_load(fd, bytes, size, loadstart, loadend, stack_ptr);
+}
+
+// Reset all fiddly process state to the clean slate required by the new
+// process in exec(). Since this starts to mess with process state, all errors
+// result in terminating the process.
+// This runs with all old memory still mapped, so we can use libc and errno freely.
+void reset_process(const int keep_fd) {
     // Disable the alternate signal stack as mandated by POSIX (required also
     // since the alternative stack might point into memory we're about to
     // unmap).
@@ -684,6 +654,67 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     // - PR_SET_NAME process name is reset to the executable name
     // - SECBIT_KEEP_CAPS[securebits] is cleared
     // - termination signal is reset to SIGCHLD
+    //   This should probably be done first since errors cause termination in this section
+    //
+    // I think the above stuff can all be done before we start unmapping
+    // memory, which means we can use libc to do it.
+}
+
+// This function does everything after the "point of no return", we start unmapping memory and 
+void finish_load(int fd, const uint8_t* const bytes, const size_t size, u64 loadstart, u64 loadend, void* stack_ptr) {
+    // TODO Prepare a list of instructions from the other function instead of
+    // getting it from ELF headers here, then send only the original file
+    // descriptor?
+    // The plan then is that everything old is unmapped right away except for
+    // the trampoline code and data. Probably the data is stored on the new
+    // stack such that it is popped before jumping to the entry point.
+    // The trampoline then covers mmap and memset as required.
+    Elf64_Ehdr* const ehdr = (Elf64_Ehdr*)bytes;
+    for (int ph = 0; ph < ehdr->e_phnum; ph++) {
+        const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
+        Elf64_Phdr* const phdr = (Elf64_Phdr*)(bytes + phoff);
+
+        if (phdr->p_type == PT_LOAD) {
+            const u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
+            const u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
+            const u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
+
+            const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
+            const u64 file_page = phdr->p_offset - file_offset;
+            const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
+
+            debug("Mapping %08lx..%08lx to %08lx..%08lx (%08lx..%08lx)\n",
+                    phdr->p_offset, phdr->p_offset + phdr->p_filesz,
+                    phdr->p_vaddr, phdr->p_vaddr + phdr->p_memsz,
+                    vaddr_page, vaddr_page + vaddr_size);
+
+            const int prot = prot_from_flags(phdr->p_flags);
+            if (file_size) {
+                if (mmap((void*)vaddr_page, file_size, prot,
+                            MAP_PRIVATE | MAP_FIXED, fd, file_page) == MAP_FAILED) {
+                    EXIT_ERRNO(errno, "mmap failed");
+                }
+            }
+
+            // TODO Add tests:
+            // - check that extra BSS pages are accessible and zeroed
+            // - check that the BSS part of the tail of the .data section is properly zeroed
+            if (vaddr_size > file_size) {
+                debug("Mapping BSS %08lx..%08lx\n", vaddr_page + file_size, vaddr_page + vaddr_size);
+                if (mmap((void*)(vaddr_page + file_size), vaddr_size - file_size, prot,
+                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0) == MAP_FAILED) {
+                    EXIT_ERRNO(errno, "mmap failed");
+                }
+            }
+            if (phdr->p_memsz > phdr->p_filesz) {
+                const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
+                const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
+                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
+                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
+                memset((void*)vaddr_file_end, 0, clear_end - vaddr_file_end);
+            }
+        }
+    }
 
     // Unmap everything we don't want anymore, e.g. everything except:
     // - new program's stack
@@ -697,9 +728,8 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     const Elf64_Addr entrypoint = ehdr->e_entry;
     munmap((void*)bytes, size);
 
-    if (prctl(PR_SET_MM, PR_SET_MM_MAP, (unsigned long)&mm_map, sizeof(mm_map), 0)) {
-        EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
-    }
+    // TODO This can only be done after unmapping all pages of the old
+    // executable, so it needs to be part of the evantual trampoline function.
     if (prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)) {
         // Not an error, since this requires additional privileges for now ignore failures.
         debug("PR_SET_MM_EXE_FILE failed\n");
@@ -708,15 +738,7 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     const uintptr_t mypage = round_down(get_rip(), PAGE_SIZE);
     debug("Preparing to clean up virtual memory:\n");
     debug("mypage: %lx\n", mypage);
-    debug("stack: %p..%p\n", stack_start, stack_end);
-    debug("binary: %lx..%lx\n", loadstart, loadend);
-
-    // This is to keep track of the range of things (including the stack) that we need to keep around.
-    // This is pretty bad though, since the stack seems to end up near the end
-    // of address space, so we just preserve everything. Should be much more
-    // fine-grained.
-    loadstart = MIN(loadstart, (uintptr_t)stack_start);
-    loadend = MAX(loadend, (uintptr_t)stack_end);
+    debug("binary+stack: %lx..%lx\n", loadstart, loadend);
     const uintptr_t loadend_page = round_up(loadend, PAGE_SIZE);
     debug("keeping bin+stack: %16lx..%16lx\n", loadstart, loadend);
     debug("keeping myself:    %16lx..%16lx\n", mypage, mypage + PAGE_SIZE);
