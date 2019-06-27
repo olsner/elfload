@@ -39,5 +39,5 @@ static int open(const char* path, int flags) {
     return syscall3(__NR_open, (uintptr_t)path, flags, 0);
 }
 static int close(int fd) {
-    syscall3(__NR_close, fd, 0, 0);
+    return syscall3(__NR_close, fd, 0, 0);
 }
