@@ -749,9 +749,11 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
             if (phdr->p_memsz > phdr->p_filesz) {
                 const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
                 const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
-                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
-                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
-                ADD_LOADCMD(LC_Memset0, vaddr_file_end, vaddr_size - file_size);
+                if (clear_end > vaddr_file_end) {
+                    debug("Clearing %zu bytes in partial page from file: %08lx..%08lx\n",
+                            clear_end - vaddr_file_end, vaddr_file_end, clear_end);
+                    ADD_LOADCMD(LC_Memset0, vaddr_file_end, clear_end - vaddr_file_end);
+                }
             }
         }
     }
