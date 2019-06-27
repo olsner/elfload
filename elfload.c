@@ -438,12 +438,26 @@ static size_t fsize(int fd) {
     return st.st_size;
 }
 
-// NB: there are more magic mappings we might want to avoid. Annoying stuff.
 static void get_vdso_range(uintptr_t *start, uintptr_t *end) {
-    *start = getauxval(AT_SYSINFO_EHDR);
-    //const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)*start;
-    // Lazy :)
-    *end = *start + PAGE_SIZE;
+    uintptr_t vdso_start = getauxval(AT_SYSINFO_EHDR);
+    size_t vdso_size = PAGE_SIZE;
+    // TODO Not really safe to hardcode, should extract the actual size from vdso or kernel info somehow. Worst case we could just parse /proc/self/maps?
+    const size_t vvar_size = 3 * PAGE_SIZE;
+    // Checking what's available there
+    const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)vdso_start;
+    for (int ph = 0; ph < ehdr->e_phnum; ph++) {
+        const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
+        const Elf64_Phdr* phdr = (const Elf64_Phdr*)(vdso_start + phoff);
+
+        debug("vDSO header %d: type=%x (%s)\n", ph, phdr->p_type, get_ptype_name(phdr->p_type));
+
+        if (phdr->p_type == PT_LOAD) {
+            uintptr_t loadend = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE);
+            vdso_size = MAX(vdso_size, loadend);
+        }
+    }
+    *start = vdso_start - vvar_size;
+    *end = vdso_start + vdso_size;
 }
 
 static uintptr_t get_rip(void) {
@@ -555,6 +569,7 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
 
     uintptr_t vdso_start, vdso_end;
     get_vdso_range(&vdso_start, &vdso_end);
+    debug("vDSO range: %lx..%lx\n", vdso_start, vdso_end);
 
     // FIXME Make sure this doesn't overlap where we're about to put anything
     // either. Should probably go before relocate so we know we don't need
