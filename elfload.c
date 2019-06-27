@@ -248,6 +248,10 @@ static u64 round_up(u64 x, u64 align) {
     return (x + align - 1) & -align;
 }
 
+static u64 is_aligned(u64 x, u64 align) {
+    return !(x & (align - 1));
+}
+
 static NORETURN void switch_to(void* stack, uintptr_t rip) {
     asm volatile("mov %0, %%rsp; jmp *%1":: "r"(stack), "r"(rip), "d"(0));
     // Should be unreachable!
@@ -260,6 +264,62 @@ static size_t copy_str(void* dst, const char* src) {
     return n;
 }
 
+static size_t get_args_size(char *const argv[], size_t* count) {
+    char*const* p;
+    size_t args_size = 0;
+    size_t argc = 0;
+    for (p = argv; *p; p++) {
+        args_size += strlen(*p) + 1;
+        argc++;
+    }
+    *count = argc;
+    return args_size;
+}
+
+// Return argument (data) size, store count by reference.
+static size_t get_auxv_size(const auxv_t* auxv, size_t* count) {
+    size_t args_size = 0;
+    size_t auxc = 0;
+    for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
+        switch (auxp->a_type) {
+        case AT_RANDOM:
+            args_size += 16;
+            break;
+        case AT_PLATFORM:
+            args_size += strlen(auxp->a_str) + 1;
+            break;
+        // TODO AT_EXECFN
+        }
+        auxc++;
+    }
+    *count = auxc;
+    return args_size;
+}
+
+// Duplicates a lot of stuff calculated in build_stack. Return a struct of stack layout data?
+static size_t get_stack_size(char *const argv[], char *const envp[], const auxv_t* auxv) {
+    size_t args_size = 0;
+    size_t argc = 0, envc = 0, auxc = 0;
+
+    args_size += get_args_size(argv, &argc);
+    args_size += get_args_size(envp, &envc);
+    args_size += get_auxv_size(auxv, &auxc);
+
+    // TODO Check args_size against limit (accounting for all the pointers and
+    // a minimum process stack size).
+    args_size = (args_size + 7) / 8;
+
+    size_t stack_words = 2 * (1 + auxc) + (1 + envc) + (1 + argc) + 1;
+    // If we have an odd number of words left to push and the stack is
+    // currently 16 byte aligned, misalign the stack by 8 bytes.
+    // And vice versa.
+    if (!(stack_words & 1) != !(args_size & 8)) {
+        stack_words++;
+    }
+
+    return args_size + stack_words * 8;
+}
+
 // Stack on entry:
 // [from %rsp and increasing addresses!]
 // argc
@@ -268,48 +328,24 @@ static size_t copy_str(void* dst, const char* src) {
 // env[]
 // nullptr
 // aux[] (2 qwords each)
-// AT_NULL
+// 2 * AT_NULL
 //
 // Remaining space may be used to copy the environment, arguments and aux
 // vector information.
-static void* build_stack(void* stack_start, u64* stack_end, char *const*const argv, char *const*const envp, const auxv_t* auxv, struct prctl_mm_map* mm_map) {
+static void* build_stack(void* stack_start, u64* stack_end, char *const argv[], char *const envp[], const auxv_t* auxv, struct prctl_mm_map* mm_map) {
     size_t args_size = 0;
     size_t argc = 0, envc = 0, auxc = 0;
 
-    char *const *p;
-    for (p = argv; *p; p++) {
-        args_size += strlen(*p) + 1;
-        argc++;
-    }
-    for (p = envp; *p; p++) {
-        args_size += strlen(*p) + 1;
-        envc++;
-    }
+    args_size += get_args_size(argv, &argc);
+    args_size += get_args_size(envp, &envc);
+    args_size += get_auxv_size(auxv, &auxc);
+
     // For now, assume that the aux vector is always built by copying the one
     // for the current process. In reality, it's filled in by the kernel.
     for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
         debug("input auxv %ld (%s): %p\n", auxp->a_type, get_atype_name(auxp->a_type), auxp->a_ptr);
-        switch (auxp->a_type) {
-        case AT_RANDOM:
-            args_size += 16;
-            break;
-        case AT_PLATFORM:
-            args_size += strlen(auxp->a_str) + 1;
-            break;
-        // Skipped below, so skip over here to get the correct auxc
-        case AT_EXECFN:
-        case AT_PHDR:
-        case AT_PHENT:
-        case AT_PHNUM:
-        case AT_BASE:
-        case AT_ENTRY:
-            break;
-        }
-        auxc++;
     }
 
-    // TODO Check args_size against limit (accounting for all the pointers and
-    // a minimum process stack size).
     stack_end -= (args_size + 7) / 8;
 
     const size_t stack_words = 2 * (1 + auxc) + (1 + envc) + (1 + argc) + 1;
@@ -319,10 +355,9 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const*const ar
     if (!(stack_words & 1) != !((uintptr_t)stack_end & 8)) {
         stack_end--;
     }
-    // TODO Since we've calculated the number of words we need now, we could
-    // fill in the data forwards instead of backwards.
     char *data_start = (char *)stack_end;
 
+    // TODO Since we have auxc we could fill this in forwards.
     *--stack_end = AT_NULL;
     *--stack_end = AT_NULL;
     for (const auxv_t* auxp = auxv; auxp->a_type != AT_NULL; auxp++) {
@@ -429,25 +464,27 @@ static void munmap_range(uintptr_t start, uintptr_t end) {
 int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     const size_t size = fsize(fd);
 
+    const size_t used_stack = get_stack_size((char**)argv, (char**)envp, find_auxv(environ));
+
     // Mapped PROT_READ initially. we'll remap the pages with appropriate
     // protections in the load part, this is just for reading the headers.
     // Could avoid mapping the whole file if we wanted to.
     const uint8_t* const bytes = (const uint8_t *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (bytes == MAP_FAILED) {
-        return -1;
+        RETURN_ERRNO(errno, "Failed mapping executable");
     }
 
     CHECK_SIZE(EI_NIDENT);
 
     if (invalid_elf_file(bytes, size)) {
-        return -1;
+        RETURN_ERRNO(ENOEXEC, "Not valid ELF file");
     }
 
     GETHEADER(ehdr, Ehdr, 0);
     Elf64_Addr loadstart = UINT64_MAX, loadend = 0;
     int found_interpreter = 0;
     int stack_prot = PROT_READ | PROT_WRITE;
-    int stack_size = DEFAULT_STACK_SIZE;
+    size_t stack_size = round_up(used_stack, PAGE_SIZE) + DEFAULT_STACK_SIZE;
     for (int ph = 0; ph < ehdr->e_phnum; ph++) {
         const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
         GETHEADER(phdr, Phdr, phoff);
@@ -461,17 +498,21 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
             // too, but provide our own interpreter for those. Then we should
             // have a clean way to handle both cases?
         case PT_LOAD:
+            if ((phdr->p_offset ^ phdr->p_vaddr) & (PAGE_SIZE - 1)) {
+                RETURN_ERRNO(EINVAL, "Impossible file/vaddr offset mismatch");
+            }
+
             loadstart = MIN(phdr->p_vaddr, loadstart);
             loadend = MAX(phdr->p_vaddr + phdr->p_memsz, loadend);
             break;
         case PT_GNU_STACK:
             // How about a read-only or inaccessible stack? Seems ridiculous though :)
             if (phdr->p_flags & PF_X) stack_prot |= PROT_EXEC;
-            // TODO The size of the stack can be indicated using the p_memsz of
-            // this program header. Update stack_size if that size looks good.
+            // FDPIC ELF uses p_memsz to indicate stack size too, but it seems normal ELFs don't do that.
             break;
         }
     }
+    assert(is_aligned(stack_size, PAGE_SIZE));
     if (found_interpreter) {
         RETURN_ERRNO(EINVAL, "Interpreted ELF files not supported yet");
     }
@@ -503,6 +544,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         .exe_fd = (u32)-1
     };
     unsigned int mm_map_size = 0;
+    // TODO Since we lose attributes of the old process here, this should be
+    // considered the point of no return or at least happen after it. Is it
+    // necessary to do it this early?
     if (prctl(PR_SET_MM, PR_SET_MM_MAP_SIZE, (unsigned long)&mm_map_size, 0, 0)) {
         RETURN_ERRNO(errno, "Failed getting size of struct mm_map");
     } else if (mm_map_size != sizeof(mm_map)) {
@@ -515,18 +559,16 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     // FIXME Make sure this doesn't overlap where we're about to put anything
     // either. Should probably go before relocate so we know we don't need
     // anything at all from the old address space (except the loader code
-    // itself). We can move the stack if it does though, it's a single big block.
+    // itself). The stack could be moved after the fact but the pointers would
+    // need updating. Alternatively, if we know the final location we can
+    // adjust pointers while building it.
     void *const stack_start = mmap(0, stack_size, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack_start == MAP_FAILED) {
-        EXIT_ERRNO(errno, "stack mmap failed");
+        RETURN_ERRNO(E2BIG, "stack mmap failed");
     }
     void *const stack_end = (char*)stack_start + stack_size;
 
     void *const stack_ptr = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ), &mm_map);
-    if (!stack_ptr) {
-        // TODO Unmap anything we mapped before
-        RETURN_ERRNO(E2BIG, "Command line/environment too big");
-    }
     debug("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_ptr);
 
     // Point of no return: If we fail from now on we can only just _exit(1).
@@ -552,10 +594,6 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
             const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
             const u64 file_page = phdr->p_offset - file_offset;
             const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
-
-            if (file_offset != vaddr_offset) {
-                EXIT_ERRNO(errno, "Impossible file/vaddr offset mismatch");
-            }
 
             debug("Mapping %08lx..%08lx to %08lx..%08lx (%08lx..%08lx)\n",
                     phdr->p_offset, phdr->p_offset + phdr->p_filesz,
@@ -610,7 +648,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         int max_sig = sizeof(oldact.sa_mask) * CHAR_BIT;
         for (int i = 0; i < max_sig; i++) {
             if (sigaction(i, NULL, &oldact)) {
-                debug("sigaction error %d (%s)\n", errno, strerror(errno));
+                if (errno != EINVAL) {
+                    debug("%d: sigaction error %d (%s)\n", i, errno, strerror(errno));
+                }
                 continue;
             }
             if (oldact.sa_handler != SIG_DFL && oldact.sa_handler != SIG_IGN) {
