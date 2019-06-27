@@ -7,7 +7,7 @@ OUTDIR ?= out
 CFLAGS := -std=gnu11
 CFLAGS += -g -Os -march=native
 CFLAGS += -ffunction-sections -fdata-sections
-CFLAGS += -fPIC
+CFLAGS += -fPIC -fno-jump-tables
 
 CFLAGS += -W -Wall -Wextra -Werror
 CFLAGS += -Wstrict-prototypes -Wmissing-prototypes

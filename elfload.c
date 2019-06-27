@@ -12,6 +12,7 @@
 #include <linux/sched.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 
 typedef uint64_t u64;
 typedef uint32_t u32;
+typedef uint16_t u16;
 typedef uint8_t u8;
 typedef struct auxv_t {
     u64 a_type;
@@ -44,12 +46,8 @@ extern char **environ;
 // do we check for that feature from user space?
 static const uintptr_t USER_VADDR_END = (1ull << 47) - PAGE_SIZE;
 
-#if enable_debug
-#define debug_printf(fmt, ...) printf(fmt, ## __VA_ARGS__)
-#else
-#define debug_printf(fmt, ...) (void)sizeof(printf(fmt, ## __VA_ARGS__))
-#endif
-#define debug(fmt, ...) debug_printf("%s:%d: " fmt, __FILE__, __LINE__, ## __VA_ARGS__)
+#define debug_printf(f, l, fmt, ...) do { if (enable_debug) fprintf(stderr, "%s:%d: " fmt, f, l, ## __VA_ARGS__); } while (0)
+#define debug(fmt, ...) debug_printf(__FILE__, __LINE__, fmt, ## __VA_ARGS__)
 
 #define CASE(e) case e: return #e
 static const char *get_ptype_name(int ptype) {
@@ -111,6 +109,21 @@ static const char *get_atype_name(int atype) {
     }
 }
 
+static inline int64_t syscall6(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6) {
+    int64_t res;
+    register int64_t r8 __asm__("r8") = arg5;
+    register int64_t r9 __asm__("r9") = arg6;
+    // r10 takes the place of rcx in the usual convention since rcx is taken by syscall
+    register int64_t r10 __asm__("r10") = arg4;
+    __asm__ __volatile__ ("syscall"
+            : /* return value(s) */
+            "=a" (res),
+            /* clobbered inputs */
+            "=D" (arg1), "=S" (arg2), "=d" (arg3), "=r" (r8), "=r" (r9), "=r"(r10)
+            : "a" (nr), "D" (arg1), "S" (arg2), "d" (arg3), "r" (r8), "r" (r9), "r"(r10)
+            : "r11", "%rcx", "memory");
+    return res;
+}
 static inline int64_t syscall2(uint64_t nr, uint64_t arg1, uint64_t arg2) {
     int64_t res;
     __asm__ __volatile__ ("syscall"
@@ -124,7 +137,8 @@ static inline int64_t syscall2(uint64_t nr, uint64_t arg1, uint64_t arg2) {
     return res;
 }
 static NORETURN void raw_exit(int status) {
-    for (;;) syscall2(__NR_exit, status, 0);
+    syscall2(__NR_exit, status, 0);
+    __builtin_unreachable();
 }
 static int raw_munmap(void *start, size_t length) {
     return syscall2(__NR_munmap, (u64)start, (u64)length);
@@ -132,20 +146,30 @@ static int raw_munmap(void *start, size_t length) {
 static uintptr_t raw_brk(uintptr_t addr) {
     return syscall2(__NR_brk, addr, 0);
 }
+// Note on x86-64, the system call takes a byte offset. Various architectures
+// have different variants, e.g. x86 has mmap2 for page offset (allowing larger
+// offsets than fit in 32 bits) and mmap for byte offset.
+static intptr_t raw_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    return syscall6(__NR_mmap, (u64)addr, length, prot, flags, fd, offset);
+}
+static void* inline_memset(void* dest, int c, size_t n) {
+	asm("rep stosb": "+D"(dest), "+c"(n), "=m"(dest) : "a"(c) : "memory");
+	return dest;
+}
 
 static NORETURN void unimpl(const char *what) {
     printf("UNIMPL: %s\n", what);
     abort();
 }
 static void debug_check(const char *file, int line, const char *why, int err) {
-    debug_printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
+    debug_printf(file, line, "returning error %d (%s): %s\n", err, strerror(err), why);
 }
 static NORETURN void exit_errno(const char *file, int line, const char *why, int err) {
     printf("%s:%d: returning error %d (%s): %s\n", file, line, err, strerror(err), why);
     _exit(1);
 }
 static NORETURN void assert_failed(const char *file, int line, const char *what) {
-    debug_printf("%s:%d: assertion failed: %s\n", file, line, what);
+    debug_printf(file, line, "assertion failed: %s\n", what);
     _exit(1);
 }
 
@@ -161,34 +185,6 @@ static NORETURN void assert_failed(const char *file, int line, const char *what)
 #define SELF_SIZE 4096
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
-
-static bool no_overlap(uintptr_t start1, uintptr_t end1, const void* p2, uintptr_t size2) {
-    const uintptr_t start2 = (uintptr_t)p2;
-    const uintptr_t end2 = start2 + size2;
-    return end2 < start1 || start2 > end1;
-}
-
-static int relocate_to(uintptr_t target) {
-    debug("Relocate to %tx\n", target);
-    unimpl("relocate_to");
-}
-
-static int check_relocate(Elf64_Addr loadstart, Elf64_Addr loadend, const void *bytes, uintptr_t size) {
-    // Perhaps split up into another function for the "rest" that is explicitly relocatable.
-    if (no_overlap(loadstart, loadend, &el_fexecve, SELF_SIZE)
-        && no_overlap(loadstart, loadend, bytes, size)) {
-        // TODO Do relocation anyway so that we force it to be tested
-        debug("Sweet! no relocation necessary!\n");
-        return 0;
-    } else if (loadstart > 0x100000 + SELF_SIZE) {
-        // TODO Relocate the program too? It could probably be done on the fly while loading though.
-        return relocate_to(loadstart - SELF_SIZE);
-    } else if (loadend < USER_VADDR_END - SELF_SIZE) {
-        return relocate_to(loadend);
-    } else {
-        return 1;
-    }
-}
 
 static int invalid_elf_file(const uint8_t* const bytes, const size_t size) {
     if (memcmp(bytes, ELFMAG, SELFMAG)) {
@@ -254,8 +250,7 @@ static u64 is_aligned(u64 x, u64 align) {
 
 static NORETURN void switch_to(void* stack, uintptr_t rip) {
     asm volatile("mov %0, %%rsp; jmp *%1":: "r"(stack), "r"(rip), "d"(0));
-    // Should be unreachable!
-    abort();
+    __builtin_unreachable();
 }
 
 static size_t copy_str(void* dst, const char* src) {
@@ -438,7 +433,7 @@ static size_t fsize(int fd) {
     return st.st_size;
 }
 
-static void get_vdso_range(uintptr_t *start, uintptr_t *end) {
+static void get_vdso_range(void** start, void** end) {
     uintptr_t vdso_start = getauxval(AT_SYSINFO_EHDR);
     size_t vdso_size = PAGE_SIZE;
     // TODO Not really safe to hardcode, should extract the actual size from vdso or kernel info somehow. Worst case we could just parse /proc/self/maps?
@@ -456,24 +451,127 @@ static void get_vdso_range(uintptr_t *start, uintptr_t *end) {
             vdso_size = MAX(vdso_size, loadend);
         }
     }
-    *start = vdso_start - vvar_size;
-    *end = vdso_start + vdso_size;
+    *start = (void*)(vdso_start - vvar_size);
+    *end = (void*)(vdso_start + vdso_size);
 }
 
-static uintptr_t get_rip(void) {
-    return (uintptr_t)__builtin_return_address(0);
-}
+enum loadcmd_type {
+    // Unmap: munmap(par[0].p, par[1].p - par[0].p)
+    LC_Unmap,
+    // mmap(par[0].p (address), par[1].u (size), par[2].u (prot), [implicit flags], par[3].i (fd), par[4].u (offset in file))
+    LC_Map,
+    // mmap(par[0].p (address), par[1].u (size), par[2].u (pro)) anonymous, read/write and zeroed
+    LC_MapAnon,
+    // memset(par[0].p, 0, par[1].u)
+    LC_Memset0,
+    // PR_SET_MM_EXE_FILE with par[0].i
+//    LC_SetExeFD,
+    // Set rsp=par[0], jump to rip=par[1], this terminates the program.
+    // TODO Also clear any registers that should have defined values on entry.
+    // TODO Figure out a way to combine this with unmapping the page of memory
+    // that we are currently running from. Maybe a bit of ROP programming - set
+    // registers for the munmap call, push the entre point and a pointer to a
+    // syscall+ret combination e.g. in the vdso, then "return" to it.
+    LC_Enter
+};
+struct loadcmd {
+    enum loadcmd_type cmd;
+    union {
+        intptr_t i;
+        uintptr_t u;
+        void* p;
+    } par[5];
+};
+typedef struct loadcmd loadcmd;
 
-static void munmap_range(uintptr_t start, uintptr_t end) {
-    //debug("Unmapping %16lx..%16lx\n", start, end);
-    int e;
-    if ((e = raw_munmap((void*)start, end - start))) {
-        raw_exit(e);
+static void run_loadcmd(loadcmd cmd) {
+    intptr_t res = 0;
+    switch (cmd.cmd) {
+    case LC_Unmap:
+        res = raw_munmap(cmd.par[0].p, cmd.par[1].p - cmd.par[0].p);
+        break;
+    case LC_Map: {
+        int prot = cmd.par[2].u;
+        res = raw_mmap(cmd.par[0].p, cmd.par[1].u, prot,
+                MAP_FIXED | (prot & PROT_WRITE ? MAP_PRIVATE : MAP_SHARED),
+                cmd.par[3].i, cmd.par[4].u);
+        break;
+    }
+    case LC_MapAnon:
+        res = raw_mmap(cmd.par[0].p, cmd.par[1].u, cmd.par[2].u,
+                MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        break;
+    case LC_Memset0:
+        inline_memset(cmd.par[0].p, 0, cmd.par[1].u);
+        break;
+    case LC_Enter:
+        switch_to(cmd.par[0].p, cmd.par[1].u);
+        break;
+    }
+
+    if (res < 0) {
+        abort();
     }
 }
+// Interpret a load script starting at p, until it encounters an LC_Enter command
+NORETURN static void run_loadscript(loadcmd* p, loadcmd* q) {
+    for (;;) run_loadcmd(*p++);
+}
+
+static void debug_loadcmd(const char* file, int line, loadcmd cmd) {
+    switch (cmd.cmd) {
+    case LC_Unmap:
+        debug_printf(file, line, "LOADCMD: munmap(%p..%p)\n", cmd.par[0].p, cmd.par[1].p);
+        break;
+    case LC_Map: {
+        size_t length = cmd.par[1].u;
+        size_t offset = cmd.par[4].u;
+        int prot = cmd.par[2].i;
+        debug_printf(file, line, "LOADCMD: mmap(%p <= %zu bytes from %#lx prot=%c%c%c)\n",
+                cmd.par[0].p, length, offset,
+                prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+        break;
+    }
+    case LC_MapAnon: {
+        size_t length = cmd.par[1].u;
+        int prot = cmd.par[2].i;
+        debug_printf(file, line, "LOADCMD: mmap(%p <= %zu anonymous bytes prot=%c%c%c)\n",
+                cmd.par[0].p, length,
+                prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-', prot & PROT_EXEC ? 'x' : '-');
+        break;
+    }
+    case LC_Memset0:
+        debug_printf(file, line, "LOADCMD: memset(%p, %d, %zu)\n", cmd.par[0].p, 0, cmd.par[1].u);
+        break;
+    case LC_Enter:
+        debug_printf(file, line, "LOADCMD: switch_to(rsp=%p, entry=%p)\n", cmd.par[0].p, cmd.par[1].p);
+        break;
+    }
+}
+static void debug_loadscript(loadcmd* p, loadcmd* q) {
+    while (p < q) debug_loadcmd(__FILE__, __LINE__, *p++);
+}
+
+static void add_loadcmd(loadcmd** dest, enum loadcmd_type cmd, ...) {
+    struct loadcmd c;
+    c.cmd = cmd;
+    va_list ap;
+    va_start(ap, cmd);
+    for (int i = 0; i < 5; i++) {
+        c.par[i].u = va_arg(ap, uintptr_t);
+    }
+    va_end(ap);
+
+    *(*dest)++ = c;
+}
+#define ADD_LOADCMD(cmd, ...) \
+    do { \
+        assert(loadscript < loadscript_limit); \
+        add_loadcmd(&loadscript, cmd, ## __VA_ARGS__); \
+        debug_loadcmd(__FILE__, __LINE__, loadscript[-1]); \
+    } while (0)
 
 static void reset_process(int keep_fd);
-NORETURN static void finish_load(int fd, const uint8_t* const bytes, const size_t size, u64 loadstart, u64 loadend, void* stack_ptr);
 
 /**
  * Like with fexecve, the FD_CLOEXEC flag should usually be set on the executable.
@@ -536,12 +634,6 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     if (loadend <= loadstart) {
         RETURN_ERRNO(EINVAL, "Nothing to load");
     }
-    debug("Load addresses at %lx..%lx, self at %p, data at %p..%p\n",
-            loadstart, loadend, &el_fexecve, bytes, bytes + size);
-
-    if (check_relocate(loadstart, loadend, bytes, size)) {
-        RETURN_ERRNO(ENOMEM, "No space to relocate the ELF loader");
-    }
 
     // Must be strictly larger than end_data and start_data
     const uintptr_t start_brk = (loadend + PAGE_SIZE) & -PAGE_SIZE;
@@ -567,24 +659,109 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         RETURN_ERRNO(ENOSYS, "Incompatible struct mm_map");
     }
 
-    uintptr_t vdso_start, vdso_end;
+    void* vdso_start;
+    void* vdso_end;
     get_vdso_range(&vdso_start, &vdso_end);
-    debug("vDSO range: %lx..%lx\n", vdso_start, vdso_end);
+    debug("vDSO range: %p..%p\n", vdso_start, vdso_end);
 
-    // FIXME Make sure this doesn't overlap where we're about to put anything
-    // either. Should probably go before relocate so we know we don't need
-    // anything at all from the old address space (except the loader code
-    // itself). The stack could be moved after the fact but the pointers would
-    // need updating. Alternatively, if we know the final location we can
-    // adjust pointers while building it.
+    // FIXME Make sure this doesn't overlap where we're about to put anything.
+    // The stack could be moved after the fact but the pointers would need
+    // updating. Alternatively if we know a usable final location we can adjust
+    // pointers while building it, then remap the stack.
     void *const stack_start = mmap(0, stack_size, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack_start == MAP_FAILED) {
         RETURN_ERRNO(E2BIG, "stack mmap failed");
     }
-    void *const stack_end = (char*)stack_start + stack_size;
+    void* const stack_end = (char*)stack_start + stack_size;
+    loadcmd* const loadscript_limit = stack_end;
+    loadcmd* const loadscript_start = (loadcmd*)(round_down((uintptr_t)stack_end, PAGE_SIZE) - PAGE_SIZE);
+    loadcmd* loadscript = loadscript_start;
 
     void *const stack_ptr = build_stack(stack_start, (u64*)stack_end, argv, envp, find_auxv(environ), &mm_map);
     debug("Generated %zu bytes of argument/environment data\n", stack_start + stack_size - stack_ptr);
+
+    debug("Load addresses at %lx..%lx, self at %p, stack at %p..%p (%zu bytes)\n",
+            loadstart, loadend, &el_fexecve, stack_start, stack_end, stack_size);
+
+    // Make a copy of just the run_loadscript function in a separate page. This
+    // page will be "saved" by the unmapping stuff below, but lets us unmap all
+    // pages from the old process. (TODO: Need to make sure the allocated page
+    // does not overlap any pages that will be loaded.)
+    // Could be cleaned up a bit with an assembly load script runner that doesn't need any stack. That
+    // can also tell us its size so we don't have to copy a whole page.
+    void* loadscript_runner = mmap(0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (loadscript_runner == MAP_FAILED) {
+        RETURN_ERRNO(errno, "Loader trampoline allocation failed");
+    }
+    // movabsq $stack_ptr, %rsp
+    *(u16*)loadscript_runner = 0xbc48;
+    *(void**)(loadscript_runner + 2) = stack_ptr;
+    memcpy(loadscript_runner + 10, run_loadscript, PAGE_SIZE - 10);
+    NORETURN void (*run_loadscript_ptr)(void*, void*) = loadscript_runner;
+    mprotect(loadscript_runner, PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+    const void* mypage = loadscript_runner;
+    const void* mypage_end = (char*)loadscript_runner + PAGE_SIZE;
+    debug("keeping stack:  %16p..%16p\n", stack_start, stack_end);
+    debug("keeping loader: %16p..%16p\n", mypage, mypage_end);
+    debug("keeping vDSO:   %16p..%16p\n", vdso_start, vdso_end);
+
+    ADD_LOADCMD(LC_Unmap, 0, MIN(mypage, stack_start));
+    if (mypage < stack_start) {
+        ADD_LOADCMD(LC_Unmap, mypage_end, stack_start);
+    } else if (stack_end < mypage) {
+        ADD_LOADCMD(LC_Unmap, stack_end, mypage);
+    }
+    assert(vdso_start > stack_end);
+    ADD_LOADCMD(LC_Unmap, MAX(stack_end, mypage_end), vdso_start);
+    ADD_LOADCMD(LC_Unmap, vdso_end, USER_VADDR_END);
+
+    for (int ph = 0; ph < ehdr->e_phnum; ph++) {
+        const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
+        GETHEADER(phdr, Phdr, phoff);
+
+        if (phdr->p_type == PT_LOAD) {
+            const u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
+            const u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
+            const u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
+
+            const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
+            const u64 file_page = phdr->p_offset - file_offset;
+            const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
+
+            debug("Mapping %08lx..%08lx to %08lx..%08lx (%08lx..%08lx)\n",
+                    phdr->p_offset, phdr->p_offset + phdr->p_filesz,
+                    phdr->p_vaddr, phdr->p_vaddr + phdr->p_memsz,
+                    vaddr_page, vaddr_page + vaddr_size);
+
+            const int prot = prot_from_flags(phdr->p_flags);
+            if (file_size) {
+                ADD_LOADCMD(LC_Map, vaddr_page, file_size, prot, fd, file_page);
+            }
+
+            // TODO Add tests:
+            // - check that extra BSS pages are accessible and zeroed
+            // - check that the BSS part of the tail of the .data section is properly zeroed
+            if (vaddr_size > file_size) {
+                debug("Mapping BSS %08lx..%08lx\n", vaddr_page + file_size, vaddr_page + vaddr_size);
+                ADD_LOADCMD(LC_MapAnon, vaddr_page + file_size, vaddr_size - file_size, prot);
+            }
+            if (phdr->p_memsz > phdr->p_filesz) {
+                const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
+                const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
+                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
+                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
+                ADD_LOADCMD(LC_Memset0, vaddr_file_end, vaddr_size - file_size);
+            }
+        }
+    }
+
+    debug("Unmapping image %p..%p\n", bytes, bytes + size);
+    const Elf64_Addr entrypoint = ehdr->e_entry;
+    munmap((void*)bytes, size);
+
+    // Final command: enter the new process with the appropriate stack pointer
+    ADD_LOADCMD(LC_Enter, stack_ptr, entrypoint);
 
     // From this point forward we'll start messing with the original process so
     // we should exit rather than return, but we still have access to libc
@@ -596,16 +773,16 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
     }
 
-    munmap_range(loadstart, loadend);
+    // TODO This can only be done after unmapping all pages of the old
+    // executable, so it needs to be part of the load script.
+    if (prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)) {
+        // Not an error, since this requires additional privileges for now ignore failures.
+        debug("PR_SET_MM_EXE_FILE failed\n");
+    }
 
-    // This is to keep track of the range of things (including the stack) that we need to keep around.
-    // This is pretty bad though, since the stack seems to end up near the end
-    // of address space, so we just preserve everything. Should be much more
-    // fine-grained.
-    loadstart = MIN(loadstart, (uintptr_t)stack_start);
-    loadend = MAX(loadend, (uintptr_t)stack_end);
+    debug_loadscript(loadscript_start, loadscript);
 
-    finish_load(fd, bytes, size, loadstart, loadend, stack_ptr);
+    run_loadscript_ptr(loadscript_start, loadscript);
 }
 
 // Reset all fiddly process state to the clean slate required by the new
@@ -673,105 +850,6 @@ void reset_process(const int keep_fd) {
     //
     // I think the above stuff can all be done before we start unmapping
     // memory, which means we can use libc to do it.
-}
-
-// This function does everything after the "point of no return", we start unmapping memory and 
-void finish_load(int fd, const uint8_t* const bytes, const size_t size, u64 loadstart, u64 loadend, void* stack_ptr) {
-    // TODO Prepare a list of instructions from the other function instead of
-    // getting it from ELF headers here, then send only the original file
-    // descriptor?
-    // The plan then is that everything old is unmapped right away except for
-    // the trampoline code and data. Probably the data is stored on the new
-    // stack such that it is popped before jumping to the entry point.
-    // The trampoline then covers mmap and memset as required.
-    Elf64_Ehdr* const ehdr = (Elf64_Ehdr*)bytes;
-    for (int ph = 0; ph < ehdr->e_phnum; ph++) {
-        const Elf64_Off phoff = ehdr->e_phoff + ehdr->e_phentsize * ph;
-        Elf64_Phdr* const phdr = (Elf64_Phdr*)(bytes + phoff);
-
-        if (phdr->p_type == PT_LOAD) {
-            const u64 vaddr_offset = phdr->p_vaddr & (PAGE_SIZE - 1);
-            const u64 vaddr_page = phdr->p_vaddr - vaddr_offset;
-            const u64 vaddr_size = round_up(phdr->p_vaddr + phdr->p_memsz, PAGE_SIZE) - vaddr_page;
-
-            const u64 file_offset = phdr->p_offset & (PAGE_SIZE - 1);
-            const u64 file_page = phdr->p_offset - file_offset;
-            const u64 file_size = round_up(phdr->p_offset + phdr->p_filesz, PAGE_SIZE) - file_page;
-
-            debug("Mapping %08lx..%08lx to %08lx..%08lx (%08lx..%08lx)\n",
-                    phdr->p_offset, phdr->p_offset + phdr->p_filesz,
-                    phdr->p_vaddr, phdr->p_vaddr + phdr->p_memsz,
-                    vaddr_page, vaddr_page + vaddr_size);
-
-            const int prot = prot_from_flags(phdr->p_flags);
-            if (file_size) {
-                if (mmap((void*)vaddr_page, file_size, prot,
-                            MAP_PRIVATE | MAP_FIXED, fd, file_page) == MAP_FAILED) {
-                    EXIT_ERRNO(errno, "mmap failed");
-                }
-            }
-
-            // TODO Add tests:
-            // - check that extra BSS pages are accessible and zeroed
-            // - check that the BSS part of the tail of the .data section is properly zeroed
-            if (vaddr_size > file_size) {
-                debug("Mapping BSS %08lx..%08lx\n", vaddr_page + file_size, vaddr_page + vaddr_size);
-                if (mmap((void*)(vaddr_page + file_size), vaddr_size - file_size, prot,
-                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0) == MAP_FAILED) {
-                    EXIT_ERRNO(errno, "mmap failed");
-                }
-            }
-            if (phdr->p_memsz > phdr->p_filesz) {
-                const u64 vaddr_file_end = phdr->p_vaddr + phdr->p_filesz;
-                const u64 clear_end = round_up(vaddr_file_end, PAGE_SIZE);
-                debug("Clearing %zu bytesin partial page from file: %08lx..%08lx\n",
-                        clear_end - vaddr_file_end, vaddr_file_end, clear_end);
-                memset((void*)vaddr_file_end, 0, clear_end - vaddr_file_end);
-            }
-        }
-    }
-
-    // Unmap everything we don't want anymore, e.g. everything except:
-    // - new program's stack
-    // - the loaded program itself
-    // - the elf interpreter (if loaded)
-    // - arguments and environment (stored on stack?)
-    // - the minimum necessary to jump into the new program
-    //   though if the loader is less than one page, we could just keep the whole thing
-
-    debug("Unmapping image %p..%p\n", bytes, bytes + size);
-    const Elf64_Addr entrypoint = ehdr->e_entry;
-    munmap((void*)bytes, size);
-
-    // TODO This can only be done after unmapping all pages of the old
-    // executable, so it needs to be part of the evantual trampoline function.
-    if (prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)) {
-        // Not an error, since this requires additional privileges for now ignore failures.
-        debug("PR_SET_MM_EXE_FILE failed\n");
-    }
-
-    const uintptr_t mypage = round_down(get_rip(), PAGE_SIZE);
-    debug("Preparing to clean up virtual memory:\n");
-    debug("mypage: %lx\n", mypage);
-    debug("binary+stack: %lx..%lx\n", loadstart, loadend);
-    const uintptr_t loadend_page = round_up(loadend, PAGE_SIZE);
-    debug("keeping bin+stack: %16lx..%16lx\n", loadstart, loadend);
-    debug("keeping myself:    %16lx..%16lx\n", mypage, mypage + PAGE_SIZE);
-    // Can't unmap the stack :( Need a better way to handle this stuff. The
-    // relocation step should make sure to put "us" in a well-known place.
-    munmap_range(0, MIN(mypage, loadstart));
-    if (mypage < loadstart) {
-        munmap_range(mypage + PAGE_SIZE, loadstart);
-    } else if (mypage > loadend) {
-        munmap_range(loadend_page, mypage);
-    } else {
-        // mypage is inside the range (this should eventually be impossible,
-        // but is now possible because of including the stack in loadstart/end)
-        debug("mypage is between program and stack\n");
-    }
-    // TODO This unmaps our stack and everything asplode.
-    //munmap_range(MAX(loadend_page, mypage + PAGE_SIZE), vdso_start);
-    switch_to(stack_ptr, entrypoint);
 }
 
 int el_execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags) {
