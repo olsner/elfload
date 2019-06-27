@@ -26,8 +26,6 @@ MIT license, see the file LICENSE for details.
 * exec() in a program with running threads will most likely crash as the code
   for the running threads gets unmapped. This doesn't affect fork/exec though
   since the forked child does not have any threads.
-* All parts of the previous process might not be unmapped
-* Stack size hint/request in `PT_GNU_STACK` is not respected
 * The start/end of code/data segment in `prctl_mm_map` is not correct. Unclear
   how the kernel actually uses these. Might be visible as incorrect statistics
   in some `/proc/self` files?
@@ -36,7 +34,9 @@ MIT license, see the file LICENSE for details.
 * Enough checks are not done before the "point of no return", so the previous
   process can't handle errors.
 * Not all resources will be released in error cases.
-* 32-bit programs cannot be exec()ed from a 64-bit process.
+* One page of executable code will remain mapped in the new process. We'd need
+  to find a way for this code to unmap itself at the same time as it transfers
+  control to the new executable.
 
 ## Untested features ##
 
