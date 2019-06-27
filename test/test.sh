@@ -94,7 +94,7 @@ check_output() {
 # Entry point and test runner
 
 mkdir -p tmp
-runelf=../out/runelf-pie
+runelfs=( ../out/runelf-pie ../out/runelf-static ../out/runelf )
 pass=0
 fail=0
 
@@ -103,11 +103,14 @@ if [ $# -eq 0 ]; then
 else
     funs=( "$@" )
 fi
-for f in "${funs[@]}"; do
-    runtest "$f"
+for runelf in "${runelfs[@]}"; do
+    echo "Testing $runelf"
+    for f in "${funs[@]}"; do
+        runtest "$f"
+    done
+    echo
 done
 
-echo
 echo "PASS: $pass"
 echo "FAIL: $fail"
 exit $fail
