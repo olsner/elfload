@@ -25,6 +25,7 @@ BINARIES := $(addprefix $(OUTDIR)/, \
 	hello hello-pie hello-dynamic \
 	hello-asm hello-asm-pie \
 	sleep \
+	unmap_vdso unmap_vdso-dynamic \
 	)
 LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
@@ -64,6 +65,10 @@ $(OUTDIR)/%.o: %.c
 
 $(OUTDIR)/%: %.c
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
+	$(SIZE_CC)
+
+$(OUTDIR)/%-dynamic: %.c
+	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
 $(OUTDIR)/hello-pie: hello.c
