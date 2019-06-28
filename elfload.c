@@ -124,17 +124,11 @@ static inline int64_t syscall6(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64
             : "r11", "%rcx", "memory");
     return res;
 }
+static inline int64_t syscall5(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+    return syscall6(nr, arg1, arg2, arg3, arg4, arg5, 0);
+}
 static inline int64_t syscall2(uint64_t nr, uint64_t arg1, uint64_t arg2) {
-    int64_t res;
-    __asm__ __volatile__ ("syscall"
-            : /* return value */
-            "=a" (res),
-            /* clobbered inputs */
-            "=D" (arg1), "=S" (arg2)
-            : "a" (nr), "D" (arg1), "S" (arg2)
-            /* clobbers all caller-save registers */
-            : "%rdx", "r8", "r9", "r10", "r11", "%rcx", "memory");
-    return res;
+    return syscall6(nr, arg1, arg2, 0, 0, 0, 0);
 }
 static NORETURN void raw_exit(int status) {
     syscall2(__NR_exit, status, 0);
@@ -145,6 +139,9 @@ static int raw_munmap(void *start, size_t length) {
 }
 static uintptr_t raw_brk(uintptr_t addr) {
     return syscall2(__NR_brk, addr, 0);
+}
+static int raw_close(int fd) {
+    return syscall2(__NR_close, fd, 0);
 }
 // Note on x86-64, the system call takes a byte offset. Various architectures
 // have different variants, e.g. x86 has mmap2 for page offset (allowing larger
@@ -464,8 +461,8 @@ enum loadcmd_type {
     LC_MapAnon,
     // memset(par[0].p, 0, par[1].u)
     LC_Memset0,
-    // PR_SET_MM_EXE_FILE with par[0].i
-//    LC_SetExeFD,
+    // PR_SET_MM_EXE_FILE with par[0].i, then close the file.
+    LC_SetExeFD,
     // Set rsp=par[0], jump to rip=par[1], this terminates the program.
     // TODO Also clear any registers that should have defined values on entry.
     // TODO Figure out a way to combine this with unmapping the page of memory
@@ -504,13 +501,20 @@ static void run_loadcmd(loadcmd cmd) {
     case LC_Memset0:
         inline_memset(cmd.par[0].p, 0, cmd.par[1].u);
         break;
+    case LC_SetExeFD: {
+        int fd = cmd.par[0].i;
+        // Ignore errors from this since it requires additional privileges to actually work.
+        syscall5(__NR_prctl, PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0);
+        raw_close(fd);
+        break;
+    }
     case LC_Enter:
         switch_to(cmd.par[0].p, cmd.par[1].u);
         break;
     }
 
     if (res < 0) {
-        abort();
+        raw_exit(res);
     }
 }
 // Interpret a load script starting at p, until it encounters an LC_Enter command
@@ -545,6 +549,9 @@ static void debug_loadcmd(const char* file, int line, loadcmd cmd) {
         break;
     case LC_Enter:
         debug_printf(file, line, "LOADCMD: switch_to(rsp=%p, entry=%p)\n", cmd.par[0].p, cmd.par[1].p);
+        break;
+    case LC_SetExeFD:
+        debug_printf(file, line, "LOADCMD: exe_fd=%ld\n", cmd.par[0].i);
         break;
     }
 }
@@ -775,12 +782,7 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
         EXIT_ERRNO(errno, "prctl PR_SET_MM_MAP failed");
     }
 
-    // TODO This can only be done after unmapping all pages of the old
-    // executable, so it needs to be part of the load script.
-    if (prctl(PR_SET_MM, PR_SET_MM_EXE_FILE, fd, 0, 0)) {
-        // Not an error, since this requires additional privileges for now ignore failures.
-        debug("PR_SET_MM_EXE_FILE failed\n");
-    }
+    ADD_LOADCMD(LC_SetExeFD, fd);
 
     debug_loadscript(loadscript_start, loadscript);
 
