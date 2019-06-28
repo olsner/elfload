@@ -3,9 +3,11 @@
 
 #include "elfload.h"
 
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <linux/prctl.h>
 #include <linux/random.h>
@@ -835,8 +837,23 @@ void reset_process(const int keep_fd) {
     // not affect the parent.
     unshare(CLONE_FILES);
 
-    // Close CLOEXEC files (we may need to hold on to fd to pass it to an interpreter though)
-    //   See execveat/fexecve documentation about running file descriptors with interpreters though.
+    DIR* dirp = opendir("/proc/self/fd");
+    struct dirent *ent;
+    while ((ent = readdir(dirp))) {
+        int fd = atoi(ent->d_name);
+        if (fd == keep_fd) {
+            char exe_name[PATH_MAX] = {0};
+            ssize_t res = readlinkat(dirfd(dirp), ent->d_name, exe_name, sizeof(exe_name));
+            if (res > 0 && (size_t)res < sizeof(exe_name)) {
+                prctl(PR_SET_NAME, basename(exe_name));
+            }
+        }
+        else if (fcntl(F_GETFD, fd) & FD_CLOEXEC) {
+            close(fd);
+        }
+    }
+    closedir(dirp);
+
     // Check what else kind of magic exec does to tear down the old process.
     // See execve(2).
     //
@@ -847,7 +864,6 @@ void reset_process(const int keep_fd) {
     // Linux:
     // - PR_SET_DUMPABLE is set
     // - PR_SET_KEEPCAPS is cleared
-    // - PR_SET_NAME process name is reset to the executable name
     // - SECBIT_KEEP_CAPS[securebits] is cleared
     // - termination signal is reset to SIGCHLD
     //   This should probably be done first since errors cause termination in this section

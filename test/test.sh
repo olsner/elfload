@@ -35,6 +35,11 @@ test_proc_environ() {
     check_output "foo=bar\0bar=baz\0" "$out" /proc/self/environ
     check_output "foo=bar\0bar=baz\0" "$runelf" "$out" /proc/self/environ
 }
+test_proc_comm() {
+    compile cat.c
+    check_output "test_proc_comm\n" "$out" /proc/self/comm
+    # TODO Check /proc/$pid/task/$pid/comm, which is what PR_SET_NAME affects.
+}
 
 ###############################################################################
 # Internal functions
