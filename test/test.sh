@@ -55,7 +55,8 @@ runtest() {
     return 0
 }
 compile() {
-    gcc -g -nostdlib -static -ffreestanding -o "$out" "$@"
+    gcc -g -nostdlib -static -ffreestanding -c -o "${out}.o" "$@"
+    gcc -g -nostdlib -static -ffreestanding -o "$out" "${out}.o"
 }
 check() {
     local cmd=( "$@" )

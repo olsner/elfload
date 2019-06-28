@@ -1,4 +1,5 @@
 .PHONY: all clean install commit
+.SECONDARY:
 
 include build/common.mk
 include build/makejobs.mk
@@ -25,7 +26,7 @@ BINARIES := $(addprefix $(OUTDIR)/, \
 	hello hello-pie hello-dynamic \
 	hello-asm hello-asm-pie \
 	sleep \
-	unmap_vdso unmap_vdso-dynamic \
+	unmap_vdso-dynamic \
 	)
 LIBRARIES := $(addprefix $(OUTDIR)/, libelfload.a)
 
@@ -63,23 +64,19 @@ $(OUTDIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(HUSH_CC) $(CC) $(CFLAGS) -c -MP -MMD -o $@ $<
 
-$(OUTDIR)/%: %.c
+$(OUTDIR)/%: $(OUTDIR)/%.o
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/%-dynamic: %.c
+$(OUTDIR)/%-dynamic: $(OUTDIR)/%.o
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/hello-pie: hello.c
+$(OUTDIR)/%-pie: $(OUTDIR)/%.o
 	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -pie -MP -MMD -o $@ $<
 	$(SIZE_CC)
 
-$(OUTDIR)/hello-dynamic: hello.c
-	$(HUSH_CC) $(CC) $(CFLAGS) $(LDFLAGS) -MP -MMD -o $@ $<
-	$(SIZE_CC)
-
-$(OUTDIR)/hello-asm: hello-asm.S
+$(OUTDIR)/%: %.S
 	$(HUSH_AS) $(CC) -nostdlib $(CFLAGS) $(LDFLAGS) -static -MP -MMD -o $@ $<
 	$(SIZE_AS)
 
