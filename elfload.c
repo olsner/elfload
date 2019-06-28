@@ -12,6 +12,7 @@
 #include <linux/prctl.h>
 #include <linux/random.h>
 #include <linux/sched.h>
+#include <linux/securebits.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -795,6 +796,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
 // process in exec(). Since this starts to mess with process state, all errors
 // result in terminating the process.
 // This runs with all old memory still mapped, so we can use libc and errno freely.
+// Or not completely freely - execve is specified as async-signal-safe, and if
+// we're running in a fork()ed child of a multithreaded program we must only
+// use async-signal-safe functions.
 void reset_process(const int keep_fd) {
     // Disable the alternate signal stack as mandated by POSIX (required also
     // since the alternative stack might point into memory we're about to
@@ -837,6 +841,8 @@ void reset_process(const int keep_fd) {
     // not affect the parent.
     unshare(CLONE_FILES);
 
+    // TODO opendir etc are not necessarily async-signal-safe. readdir possibly references a static variable.
+    // Maybe the raw system calls are necessary...
     DIR* dirp = opendir("/proc/self/fd");
     struct dirent *ent;
     while ((ent = readdir(dirp))) {
@@ -854,22 +860,41 @@ void reset_process(const int keep_fd) {
     }
     closedir(dirp);
 
+    // Unmapping the left-over memory also implies unlocking it, but it's
+    // possible the previous process has done mlockall(MCL_FUTURE) on us, which
+    // should not affect the new process.
+    // TODO Add test (e.g. lock some pages, check VmLck in /proc/self/status, exec and check again)
+    if (munlockall()) {
+        EXIT_ERRNO(errno, "munlockall");
+    }
+
+    prctl(PR_SET_DUMPABLE, 1);
+    prctl(PR_SET_KEEPCAPS, 0);
+    // Only expected to work if we have CAP_SETPCAP
+    prctl(PR_SET_SECUREBITS, prctl(PR_GET_SECUREBITS) & ~SECBIT_KEEP_CAPS);
+
     // Check what else kind of magic exec does to tear down the old process.
     // See execve(2).
     //
     // POSIX:
-    // - mlock/mlockall memory locks are not preserved
     // - the floating-point environment is reset
     //
     // Linux:
-    // - PR_SET_DUMPABLE is set
-    // - PR_SET_KEEPCAPS is cleared
-    // - SECBIT_KEEP_CAPS[securebits] is cleared
     // - termination signal is reset to SIGCHLD
-    //   This should probably be done first since errors cause termination in this section
+    //   This should probably be done first since errors cause termination in
+    //   this section, and sending the wrong signal would confuse the parent.
     //
-    // I think the above stuff can all be done before we start unmapping
-    // memory, which means we can use libc to do it.
+    //   Setting the termination signal can apparently only be done when
+    //   creating a thread with clone(). This sounds like what we want is to
+    //   start a new thread with the correct termination signal before killing
+    //   all source threads. (killing all threads is something we're supposed
+    //   to do anyway.)
+    //   tgkill with SIGKILL will kill the whole process, but we could e.g.
+    //   install a handler for sigrt0 that exits the current thread and send
+    //   that signal to each thread.
+    //   (This is pretty much what pthread_cancel does.)
+    //   Would need to unmask the signal in all threads in case
+    //   pthread_setcancelstate has been used.
 }
 
 int el_execveat(int dirfd, const char *path, char *const argv[], char *const envp[], int flags) {
