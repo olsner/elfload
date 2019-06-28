@@ -4,8 +4,6 @@
 #include <stdint.h>
 #include <syscall.h>
 
-// TODO Extract a utility header with the syscall wrappers and constants for doing Unix stuff without libc.
-
 #include <linux/fcntl.h>
 
 typedef intptr_t ssize_t;
