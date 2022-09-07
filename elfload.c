@@ -230,6 +230,7 @@ static u64 is_aligned(u64 x, u64 align) {
 }
 
 static NORETURN void switch_to(void* stack, uintptr_t rip) {
+    // TODO Reset all flags to zeroes, see psABI
     asm volatile("mov %0, %%rsp; jmp *%1":: "r"(stack), "r"(rip), "d"(0));
     __builtin_unreachable();
 }
@@ -365,7 +366,8 @@ static void* build_stack(void* stack_start, u64* stack_end, char *const argv[], 
         *--stack_end = a.a_type;
     }
     mm_map->auxv = (__u64*)stack_end;
-    // Includes the terminating null entries
+    // Includes the terminating null entries. For whatever reason, this needs
+    // to exactly match the kernel's AT_VECTOR_SIZE value.
     mm_map->auxv_size = 2 * (1 + auxc);
 
     // envp
@@ -570,7 +572,8 @@ static void reset_process(int keep_fd);
 int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     const size_t size = fsize(fd);
 
-    const size_t used_stack = get_stack_size((char**)argv, (char**)envp, find_auxv(environ));
+    auxv_t* const auxp = find_auxv(environ);
+    const size_t used_stack = get_stack_size((char**)argv, (char**)envp, auxp);
 
     // Mapped PROT_READ initially. we'll remap the pages with appropriate
     // protections in the load part, this is just for reading the headers.
@@ -655,10 +658,9 @@ int el_fexecve(const int fd, char *const argv[], char *const envp[]) {
     get_vdso_range(&vdso_start, &vdso_end);
     debug("vDSO range: %p..%p\n", vdso_start, vdso_end);
 
-    // FIXME Make sure this doesn't overlap where we're about to put anything.
-    // The stack could be moved after the fact but the pointers would need
-    // updating. Alternatively if we know a usable final location we can adjust
-    // pointers while building it, then remap the stack.
+    // We shouldn't need to check for overlap on the stack placement, it's only
+    // an issue for an executable that specifies a ridiculous load address.
+    // The mmap area (on x86-64) starts at something like (1<<47)/3.
     void *const stack_start = mmap(0, stack_size, stack_prot, MAP_GROWSDOWN | MAP_STACK | MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
     if (stack_start == MAP_FAILED) {
         RETURN_ERRNO(E2BIG, "stack mmap failed");
