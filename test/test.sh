@@ -66,7 +66,7 @@ compile() {
 check() {
     local cmd=( "$@" )
     if (( strace )); then
-        cmd=( strace "$@" )
+        cmd=( strace -i "$@" )
     fi
     if env -i "${testenv[@]}" "${cmd[@]}"; then
         if (( v )); then
@@ -82,15 +82,35 @@ check_output() {
     local refout=$1
     shift
     local cmd=( "$@" )
+    if (( strace )); then
+        cmd=( strace -i "$@" )
+    fi
     local outf="tmp/${testfun}.out"
+    local errf="tmp/${testfun}.err"
     local reff="tmp/${testfun}.ref"
     echo -ne "$refout" >"$reff"
-    if env -i "${testenv[@]}" "${cmd[@]}" >"$outf" && cmp -s "$outf" "$reff"; then
+
+    # Run the command
+    if (( v )); then
+        echo Running: env -i "${testenv[@]}" "${cmd[@]}" ">$outf" "2>$errf"
+    fi
+    env -i "${testenv[@]}" "${cmd[@]}" >"$outf" 2>"$errf"
+
+    # Check status and compare output
+    local res=$?
+    if (( res )); then
+        echo "FAIL: in $testfun: \"$@\" (with ${testenv[@]}) failed with status=$res"
+        (( failed_checks++ ))
+        return 1
+    fi
+    if cmp -s "$outf" "$reff"; then
         if (( v )); then
-            echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) exited with status=$?"
+            echo "PASS: in $testfun: \"$@\" (with ${testenv[@]}) succeeded and produced correct output"
         fi
     else
-        echo "FAIL: in $testfun: \"$@\" (with ${testenv[@]}) failed with status=$?"
+        echo "FAIL: in $testfun: \"$@\" (with ${testenv[@]}): wrong output"
+        printf "Expected output: %q\n" "$(cat "$reff")"
+        printf "Actual output: %q\n" "$(cat "$outf")"
         (( failed_checks++ ))
         return 1
     fi
