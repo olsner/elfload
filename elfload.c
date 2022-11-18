@@ -824,8 +824,8 @@ void reset_process(const int keep_fd) {
     // not affect the parent.
     unshare(CLONE_FILES);
 
-    // TODO opendir etc are not necessarily async-signal-safe. readdir possibly references a static variable.
-    // Maybe the raw system calls are necessary...
+    // TODO opendir etc are not necessarily async-signal-safe. readdir possibly
+    // references a static variable. Would be better to do this with getdents.
     DIR* dirp = opendir("/proc/self/fd");
     struct dirent *ent;
     while ((ent = readdir(dirp))) {
@@ -836,6 +836,10 @@ void reset_process(const int keep_fd) {
             if (res > 0 && (size_t)res < sizeof(exe_name)) {
                 prctl(PR_SET_NAME, basename(exe_name));
             }
+        }
+        else if (fd == dirfd(dirp)) {
+            // Avoid closing the directory file descriptor.
+            continue;
         }
         else if (fcntl(F_GETFD, fd) & FD_CLOEXEC) {
             close(fd);
